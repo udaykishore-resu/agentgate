@@ -89,6 +89,12 @@ jobs:
         run: |
           for f in deploy/otel/collector-agent.yaml deploy/otel/collector-gateway.yaml; do
             docker run --rm -v "$PWD/$f:/etc/otel/config.yaml" \
+              -e AGENTGATE_ENV=dev \
+              -e OTEL_GATEWAY_HOST=localhost \
+              -e TRACES_OTLP_ENDPOINT=localhost:4317 \
+              -e CONTENT_OTLP_ENDPOINT=localhost:4317 \
+              -e LOKI_ENDPOINT=http://localhost:3100/otlp \
+              -e TAIL_SAMPLING_BASELINE_PERCENT=5 \
               otel/opentelemetry-collector-contrib:0.115.1 validate --config=/etc/otel/config.yaml
           done
 
