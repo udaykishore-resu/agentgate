@@ -1117,8 +1117,8 @@ components:
         kid: {type: string}
         use: {type: string, description: 'Always `sig`.'}
         alg: {type: string, description: 'Always `RS256`.'}
-        n: {type: string, description: Base64url modulus, unpadded.}
-        e: {type: string, description: Base64url exponent, unpadded.}
+        n: {type: string, description: "Base64url modulus, unpadded."}
+        e: {type: string, description: "Base64url exponent, unpadded."}
       additionalProperties: false
 
     JWKSet:

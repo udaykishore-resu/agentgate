@@ -169,7 +169,10 @@ exporters:
         # compose. Re-resolved periodically so scaling the gateway tier does
         # not need an agent restart.
         hostname: ${env:OTEL_GATEWAY_HOST}
-        port: 4317
+        # Quoted deliberately: the loadbalancing exporter declares
+        # resolver.dns.port as a string, and an unquoted 4317 is rejected at
+        # startup with "expected type 'string', got unconvertible type 'int'".
+        port: "4317"
         interval: 30s
 
   # Metrics and logs carry no trace-affinity requirement, so they take the

@@ -13,7 +13,6 @@ fleetview ───OTLP────────┘         │ resourcedetection
                         ├─ attributes(stamp) → transform(attribution) → redaction
                         ├─ routing connector ─┬─► traces/main  → tail_sampling → OTLP traces store
                         │                     └─► traces/content → OTLP content store (no sampling)
-                        ├─ sum connector      ──► metrics/cost → Prometheus + chargeback file
                         ├─ metrics            ──► Prometheus exporter :8889
                         └─ logs               ──► Loki (OTLP)
 ```
@@ -186,19 +185,33 @@ Splits by `resource.attributes["agentgate.signal"] == "content"`.
 general path's retention, backend and access control — see
 `filter/drop-content-events` above.
 
-### `sum` connector (cost)
-Sums the `agentgate.cost.usd` span attribute into
-`agentgate_gateway_cost_usd_total`, keyed by tenant / team / cost centre /
-backend / pool / environment.
+### Cost is not aggregated in this tier — and must not be
 
-**It is wired to the ingest pipeline, before `tail_sampling`, on purpose.**
-Move it after sampling and chargeback reports roughly 5% of actual spend. That
-error is invisible in a dashboard, survives review, and is discovered at month
-end by the finance team.
+An earlier revision summed the `agentgate.cost.usd` span attribute into
+`agentgate_gateway_cost_usd_total` with a `sum` connector on the ingest
+pipeline. That has been removed, for two reasons, and it should not be added
+back without addressing both.
 
-**Remove it and:** cost attribution depends solely on the gateway's own metric
-export; there is no second, independently-derived figure to reconcile against
-when a team disputes an invoice.
+**It double-counted.** The gateway already exports a counter of that exact
+name from its own `/metrics` endpoint, and Prometheus scrapes both `gateway:9090`
+and the collector's exporter on `otel-gateway:8889`. Two producers writing one
+metric name do not give you a figure to reconcile against — they give you one
+series that reads roughly twice actual spend, in a dashboard where nothing looks
+wrong until the finance team asks.
+
+**It does not exist in the pinned distribution.** `sum` is not a component in
+`otel/opentelemetry-collector-contrib:0.115.1`; the collector refuses to start.
+
+The property the connector was reaching for — cost measured before sampling —
+is already guaranteed at the source. The gateway meters every request in
+`finish()`, which runs on the request path where no sampling decision exists,
+so the counter is complete by construction rather than by pipeline ordering.
+The authoritative ledger is the per-request `UsageRecord` written by the
+chargeback sink; the Prometheus counter is the queryable view of it.
+
+If a genuinely independent second figure is ever wanted for invoice disputes,
+it needs a **different metric name** and an explicit reconciliation query, not
+a second writer to the same series.
 
 ### `batch` / `batch/content`
 Separate batchers because the payload sizes differ by two orders of magnitude.

@@ -1120,8 +1120,8 @@ components:
         Only the span fields the trust tracker reads. A collector sending the full OTLP span is
         correct; the extra fields are ignored.
       properties:
-        traceId: {type: string, description: Lower-case hex, 32 characters.}
-        spanId: {type: string, description: Lower-case hex, 16 characters.}
+        traceId: {type: string, description: "Lower-case hex, 32 characters."}
+        spanId: {type: string, description: "Lower-case hex, 16 characters."}
         parentSpanId:
           type: string
           description: Empty on a root span. Root spans are the completeness numerator.

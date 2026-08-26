@@ -84,7 +84,8 @@ exporters:
     resolver:
       dns:
         hostname: ${env:OTEL_GATEWAY_HOST}
-        port: 4317
+        # The loadbalancing exporter declares resolver.dns.port as a string.
+        port: "4317"
         interval: 30s
 
   otlp/gateway:

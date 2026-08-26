@@ -9,8 +9,9 @@
 #   * ownership is stamped and corrected, so nobody can misreport who pays;
 #   * content is separated onto its own access-controlled path and scrubbed
 #     off the general path;
-#   * cost is summed BEFORE sampling, so chargeback stays exact even though
-#     only ~5% of traces are stored;
+#   * chargeback does NOT come from this tier at all: the gateway meters every
+#     request itself, before any sampling exists, so cost is exact by
+#     construction. See the note on cost in deploy/otel/README.md;
 #   * tail sampling keeps everything that matters and 5% of what does not.
 #
 # See deploy/otel/README.md for what each processor is for and what breaks if
@@ -222,28 +223,6 @@ connectors:
         condition: attributes["agentgate.signal"] == "content"
         pipelines: [traces/content]
 
-  # Cost aggregation. Sums the per-request agentgate.cost.usd span attribute
-  # into a metric keyed by the chargeback dimensions.
-  #
-  # This runs on the INGEST pipeline, before tail_sampling, on purpose: cost is
-  # a billing fact and must be complete. Summing after sampling would report
-  # roughly 5% of the fleet's spend and be wrong in a way nobody notices until
-  # month end.
-  sum:
-    spans:
-      agentgate.gateway.cost_usd:
-        source_attribute: agentgate.cost.usd
-        conditions:
-          - 'attributes["agentgate.cost.usd"] != nil'
-        attributes:
-          - key: agentgate.tenant.id
-          - key: agentgate.team.id
-          - key: agentgate.cost_center
-            default_value: UNATTRIBUTED
-          - key: agentgate.backend
-          - key: agentgate.pool
-          - key: deployment.environment.name
-
 exporters:
   # Trace store: Langfuse or the self-hosted OTLP store (Jaeger/Tempo locally).
   otlp/traces:
@@ -308,18 +287,6 @@ exporters:
       enabled: true
       queue_size: 4096
 
-  # Chargeback landing file (SPEC §4.4 "cost → chargeback exporter"). Locally
-  # this is the append-only file the warehouse loader reads; in cloud
-  # environments the overlay swaps this exporter for `kafka` pointed at Event
-  # Hubs (Azure) or MSK/Kinesis (AWS) — same pipeline, same attributes.
-  file/chargeback:
-    path: /tmp/agentgate-chargeback.jsonl
-    format: json
-    rotation:
-      max_megabytes: 64
-      max_days: 3
-      max_backups: 5
-
 service:
   extensions: [health_check, pprof, zpages]
   telemetry:
@@ -341,7 +308,7 @@ service:
     traces/ingest:
       receivers: [otlp]
       processors: [memory_limiter, attributes/ownership, transform/attribution, redaction/pii]
-      exporters: [routing, sum]
+      exporters: [routing]
 
     traces/main:
       receivers: [routing]
@@ -358,11 +325,6 @@ service:
       receivers: [otlp, prometheus/self]
       processors: [memory_limiter, attributes/ownership, batch]
       exporters: [prometheus]
-
-    metrics/cost:
-      receivers: [sum]
-      processors: [batch]
-      exporters: [prometheus, file/chargeback]
 
     logs:
       receivers: [otlp]

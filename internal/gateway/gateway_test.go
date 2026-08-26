@@ -771,6 +771,14 @@ func TestStreamingResponseIsWellFormed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// ReadSSE returns at the [DONE] sentinel, which the gateway writes before
+	// it meters the request. Draining the rest of the body blocks until the
+	// handler returns, which is after finish() has written the usage record —
+	// without this the assertions below race the server and fail on a loaded
+	// machine. This is a property of every streamed response, not of this test.
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("draining the stream: %v", err)
+	}
 
 	if !strings.Contains(text.String(), "streamed answer") {
 		t.Errorf("streamed text = %q", text.String())
