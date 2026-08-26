@@ -1,0 +1,299 @@
+# AgentGate agent manifest
+# =============================================================================
+#
+# Commit this file to your own repository, next to the agent it describes, and
+# register it from CI on every deployment:
+#
+#     agentctl register -f agent.yaml -env staging \
+#       -version "$APP_VERSION" -commit "$GIT_SHA" -image "$IMAGE_REF"
+#
+# Registration is idempotent on (identity, env, version). Re-running a pipeline
+# does not create a second agent or a second credential, so it is safe to call
+# on every build.
+#
+# -----------------------------------------------------------------------------
+# YAML dialect
+# -----------------------------------------------------------------------------
+#
+# AgentGate parses a deliberate subset of YAML (internal/yamlite). Supported
+# here: comments, nested block mappings by indentation, block sequences, flow
+# sequences and mappings, quoted scalars.
+#
+# NOT supported, and rejected with a line-numbered error rather than silently
+# mis-parsed:
+#
+#   * anchors and aliases (&name, *name)
+#   * tab indentation - use spaces
+#   * multiple documents in one file
+#   * tags (!!str) and complex keys
+#
+# agentctl also accepts this manifest as JSON. If the file starts with "{" it
+# is parsed as JSON instead.
+#
+# One caveat worth knowing: a key that AgentGate does not recognise is silently
+# ignored by agentctl, because the manifest is decoded into a Go struct before
+# it is sent. A typo in a field name here will not fail the build; it will
+# simply not take effect. Check the register output for the fields you set.
+#
+# -----------------------------------------------------------------------------
+# Who fills in what
+# -----------------------------------------------------------------------------
+#
+#   Owning team   - everything in this file, except where noted below.
+#   CI pipeline   - version, commit_sha, image, and the -env flag. These are
+#                   normally left out of the committed file and supplied by the
+#                   pipeline, so the manifest is not edited on every release.
+#   Platform team - granted_pools. It is NOT in this manifest: you request
+#                   pools here and the platform team grants them separately.
+#                   In production an ungranted pool means traffic is refused
+#                   with forbidden_pool.
+#   Security      - security_review_ref, once the review completes.
+#
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Identity
+# -----------------------------------------------------------------------------
+
+# The agent's workload identity. Stable across every deployment and every
+# version - it is the primary key for telemetry attribution, quota, chargeback
+# and promotion. Changing it creates a different agent and orphans all of the
+# history attached to the old one.
+#
+# Format: agent://<tenant>/<team>/<agent-name>
+#
+# Each segment must be a DNS label: lower-case letters, digits and hyphens,
+# 1-63 characters, not starting or ending with a hyphen. That restriction is
+# not aesthetic - it means the identity can appear unescaped in a Prometheus
+# label, a Kubernetes object name and a SPIFFE ID.
+#
+# The team segment must equal owner.team below. A mismatch is refused at
+# registration.
+identity: agent://fsclient/payments-risk/dispute-triage
+
+# Human-readable name, shown in the fleet view and in change records.
+# Required. Checked by the registration_complete promotion gate.
+display_name: Dispute Triage Agent
+
+# What the agent does, in one or two sentences, for whoever finds it in the
+# fleet view at 3am and has never heard of it. Optional, but the first person
+# to need it will not be you.
+description: >
+  Classifies inbound card disputes by reason code, checks the merchant's
+  evidence bundle for completeness, and routes each case to the tier-1 or
+  tier-2 queue. Read-only against the case system; it proposes a routing
+  decision and never applies one.
+
+
+# -----------------------------------------------------------------------------
+# Ownership
+# -----------------------------------------------------------------------------
+#
+# Every field here except manager is required before the agent can be promoted.
+# Checked by the registration_complete gate. An agent whose owner cannot be
+# paged is an agent that will page the platform team instead.
+
+owner:
+  # Must match the team segment of the identity URI above.
+  team: payments-risk
+
+  # A team distribution list, not an individual. People change teams; the agent
+  # outlives them.
+  email: payments-risk@client.example
+
+  # The paging rotation that owns this agent. A PagerDuty schedule key, an
+  # Opsgenie team, or whatever your on-call tooling uses. Required, because a
+  # production agent without a rotation has no owner at 3am.
+  oncall: PD-PAYRISK
+
+  # The chargeback key. It is copied into every access token this agent is
+  # issued and into every usage record it generates, so it is what the monthly
+  # cost report attributes spend to.
+  #
+  # Required. A token without a cost centre cannot reach env=prod.
+  cost_center: CC-4471
+
+  # Optional. Escalation contact for budget and risk conversations.
+  manager: a.okafor@client.example
+
+
+# -----------------------------------------------------------------------------
+# Runtime
+# -----------------------------------------------------------------------------
+
+# Where the agent runs. Becomes the agentgate.runtime resource attribute on
+# every span, which is how a runtime-specific telemetry problem is spotted.
+# Required.
+#
+# Common values: aks, eks, aca, ecs, vm, lambda, onprem
+runtime: aks
+
+# The agent framework, if any. Becomes agentgate.framework. Optional, but it is
+# what lets the platform team see that (say) every agent with broken trace
+# parenting is on the same framework version.
+#
+# Common values: langgraph, semantic-kernel, autogen, custom
+framework: langgraph
+
+
+# -----------------------------------------------------------------------------
+# Data handling
+# -----------------------------------------------------------------------------
+
+# The most sensitive class of data this agent may send to a model. Required,
+# and checked by the registration_complete gate.
+#
+#   public        No confidentiality requirement.
+#   internal      Internal-only, no customer data.
+#   confidential  Customer or commercially sensitive data. The default when an
+#                 access token does not carry a classification.
+#   restricted    Regulated data. Guardrails are always fail-closed for this
+#                 class: if the content-safety service is unreachable, the
+#                 request is refused rather than allowed through unchecked.
+#
+# This is not a label. It constrains which backends may serve the agent's
+# requests - a backend whose max_classification is lower will not be selected,
+# even if it is the only healthy one, in which case the request fails with
+# no_healthy_backend rather than being routed somewhere it should not go.
+#
+# Declare what the agent actually handles. Over-declaring restricts routing and
+# costs availability; under-declaring is a data incident.
+data_classification: confidential
+
+
+# -----------------------------------------------------------------------------
+# Model access
+# -----------------------------------------------------------------------------
+
+# The logical model pools this agent is asking for. Required, at least one.
+#
+# These are pools, not provider models. A pool is a set of interchangeable
+# backends with a routing strategy; asking for a pool means asking to be routed
+# through whichever backend in it is healthy and appropriate.
+#
+# Requesting is not being granted. The platform team grants pools separately
+# and the grant is what becomes the token's model_pools claim. In dev and
+# staging an empty grant falls back to this requested set; in production an
+# empty grant means no pools at all and every request is refused with
+# forbidden_pool. Check the register output for the "no pools have been
+# granted" warning.
+requested_pools:
+  - general-chat
+  - long-context
+
+
+# -----------------------------------------------------------------------------
+# Consumption envelope
+# -----------------------------------------------------------------------------
+#
+# What this agent expects to consume. Declare the number you have measured in
+# staging with headroom, not the number you hope never to reach: the
+# quota_declared gate checks this against your team's allocated envelope, and
+# an inflated declaration takes capacity from another team in the same
+# envelope.
+
+quota:
+  # Tokens per minute, input plus output. Enforced by a distributed token
+  # bucket keyed on tenant:team:agent:env. The gateway reserves an estimate
+  # before the call and settles the difference afterwards, so a request that
+  # asks for 4000 output tokens and produces 300 only spends 300.
+  #
+  # Must be positive. Checked by the quota_declared gate.
+  tokens_per_minute: 120000
+
+  # Requests per minute. Must be positive.
+  requests_per_minute: 600
+
+  # The monthly ceiling. Exhausting it produces quota_exceeded until the month
+  # rolls over; retrying will not help, because the fix is a quota change, not
+  # a backoff. Set it where you would want to be told, not where you would want
+  # to be stopped.
+  monthly_token_budget: 900000000
+
+  # Optional. Maximum concurrent in-flight requests for this agent. Omit if the
+  # agent has no meaningful concurrency ceiling of its own.
+  max_concurrent: 40
+
+
+# -----------------------------------------------------------------------------
+# This deployment
+# -----------------------------------------------------------------------------
+#
+# Normally supplied by CI rather than committed, because otherwise this file is
+# edited on every release. agentctl flags override what is here:
+#
+#   -version  overrides version
+#   -commit   overrides commit_sha
+#   -image    overrides image
+#
+# The -env flag is different: it is only applied when env is ABSENT from the
+# manifest. If you commit env below, -env is ignored and every pipeline stage
+# will register into the environment named here. Leave it out unless you mean
+# it.
+
+# The agent version being registered. Required, by the manifest or by -version.
+# Use the same string as your release tag: it appears in the token's
+# agent_version claim, on every span, and in every usage record, so it is how a
+# cost or latency regression is tied to a release.
+version: 2.4.1
+
+# The environment this registration is for. Commented out deliberately - let
+# the pipeline pass -env, so one manifest serves dev, staging and production.
+#
+# env: staging
+
+# Optional provenance. Both are recorded against the version and shown in the
+# fleet view, which is how "what is actually running in production" is answered
+# without asking the owning team.
+image: registry.client.example/payments-risk/dispute-triage:2.4.1
+commit_sha: 9f21c4ade1b8f0c3d5a7e2419b6c8d0f3a1e5b7c
+
+
+# -----------------------------------------------------------------------------
+# Security review
+# -----------------------------------------------------------------------------
+
+# The enterprise change or request reference for this agent's security review.
+# A ServiceNow CHG or RITM.
+#
+# Required for production only, by the security_review gate. Registration
+# without it succeeds and returns a warning; the production promotion is what
+# will block.
+#
+# Filled in by the security function once the review completes. Do not invent
+# one: the gate checks that the reference exists and has not expired, and a
+# fabricated reference is a finding rather than a shortcut.
+security_review_ref: CHG0048221
+
+
+# -----------------------------------------------------------------------------
+# Labels
+# -----------------------------------------------------------------------------
+#
+# Free-form key/value metadata carried on the agent record. Most keys are
+# yours; one is load-bearing.
+
+labels:
+  # LOAD-BEARING. The exact workload subject that token exchange will require.
+  #
+  # When this is set, the control plane demands an exact match between it and
+  # the subject of the platform token presented at token exchange. When it is
+  # absent, the control plane falls back to requiring the agent name to appear
+  # somewhere in the workload subject, which is looser than you want in
+  # production.
+  #
+  # Set it. It is the difference between "this specific service account may
+  # obtain this identity" and "anything in the cluster with a matching name
+  # may".
+  #
+  # Kubernetes: system:serviceaccount:<namespace>:<serviceaccount>
+  # Azure:      the managed identity object id
+  # SPIFFE:     the full SPIFFE ID
+  workload_subject: system:serviceaccount:payments-risk:dispute-triage
+
+  # Your own keys. These are not interpreted by the platform; they show up in
+  # the fleet view and are useful for filtering and for your own reporting.
+  business_capability: disputes
+  regulatory_scope: psd2
+  repository: https://git.client.example/payments-risk/dispute-triage

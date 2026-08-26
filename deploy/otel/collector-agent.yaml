@@ -1,0 +1,216 @@
+# AgentGate — OpenTelemetry Collector, AGENT TIER (SPEC §4.4, first hop).
+#
+# Runs as a DaemonSet (one per node) in Kubernetes and as the `otel-agent`
+# service in docker compose. Everything on the node — agent SDKs, gateway,
+# controlplane, fleetview, guardrails — sends OTLP here.
+#
+# The agent tier does three jobs and no more:
+#   1. absorb the local burst so an emitting process is never blocked,
+#   2. attach the facts only the node knows (pod, node, cloud, host),
+#   3. hand whole traces to one gateway-tier instance so tail sampling works.
+# It deliberately does NOT sample, redact or route: those are fleet-wide
+# decisions and cannot be made correctly from a single node.
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 127.0.0.1:1777
+  zpages:
+    endpoint: 127.0.0.1:55679
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        # Agent payloads can be large when content capture is on in non-prod.
+        max_recv_msg_size_mib: 16
+        # Node-local traffic only; TLS is terminated by the mesh/CNI. The
+        # NetworkPolicy in deploy/k8s is what actually restricts who may reach
+        # this port (SPEC §8).
+        keepalive:
+          server_parameters:
+            max_connection_age: 120s
+            max_connection_age_grace: 30s
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # The collector's own health, so a saturated telemetry plane is visible as a
+  # metric rather than as silence.
+  prometheus/self:
+    config:
+      scrape_configs:
+        - job_name: otel-collector-agent
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["127.0.0.1:8888"]
+
+processors:
+  # MUST be first. Refuses data before the process runs out of memory, which
+  # turns "collector OOMKilled, telemetry gone, nobody noticed" into a
+  # back-pressure signal the SDK can retry against.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  # Node-local facts. Without this, a span from a crash-looping pod is
+  # indistinguishable from a span from a healthy one.
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    # Only pods on this node — with a DaemonSet this keeps the informer's
+    # memory and API-server load proportional to the node, not the cluster.
+    filter:
+      node_from_env_var: K8S_NODE_NAME
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.pod.start_time
+        - k8s.deployment.name
+        - k8s.statefulset.name
+        - k8s.daemonset.name
+        - k8s.job.name
+        - k8s.cronjob.name
+        - k8s.node.name
+        - k8s.cluster.uid
+        - container.image.name
+        - container.image.tag
+      labels:
+        - tag_name: agentgate.team.id
+          key: agentgate.io/team
+          from: pod
+        - tag_name: service.version
+          key: app.kubernetes.io/version
+          from: pod
+      annotations:
+        # Ownership *hints* from the workload's own annotations. They are
+        # treated as claims, not facts: the gateway tier overwrites them from
+        # the verified token (SPEC §4.1) and flags the disagreement.
+        - tag_name: agentgate.cost_center.declared
+          key: agentgate.io/cost-center
+          from: pod
+        - tag_name: agentgate.owner.email.declared
+          key: agentgate.io/owner-email
+          from: pod
+        - tag_name: agentgate.framework
+          key: agentgate.io/framework
+          from: pod
+    pod_association:
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.uid
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.ip
+      - sources:
+          - from: connection
+
+  # Cloud/host identity. `override: false` means an SDK that already knows its
+  # own resource wins — the collector fills gaps, it does not rewrite truth.
+  # The AKS overlay appends `aks, azure`; the EKS overlay appends `eks, ec2`.
+  resourcedetection:
+    detectors: [env, system]
+    timeout: 5s
+    override: false
+    system:
+      hostname_sources: ["os"]
+
+  # Environment stamp. Every downstream routing, retention and access decision
+  # keys off deployment.environment.name, so it may never be absent.
+  resource/environment:
+    attributes:
+      - key: deployment.environment.name
+        value: ${env:AGENTGATE_ENV}
+        action: insert
+      - key: agentgate.telemetry.tier
+        value: agent
+        action: upsert
+      - key: k8s.node.name
+        value: ${env:K8S_NODE_NAME}
+        action: insert
+
+  # MUST be last. Amortises compression and network syscalls across spans.
+  # Sized so a full batch is comfortably under the gateway tier's 16 MiB
+  # receive limit even with content events attached.
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 5s
+
+exporters:
+  # Trace-ID-aware load balancing. This is the single most important line in
+  # this file: tail_sampling in the gateway tier can only decide on a trace it
+  # can see in full, so every span of a trace must land on the SAME gateway
+  # instance. A plain otlp exporter round-robins spans across instances and
+  # silently produces fragmented, half-sampled traces.
+  loadbalancing:
+    routing_key: traceID
+    protocol:
+      otlp:
+        timeout: 10s
+        tls:
+          insecure: true
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 15s
+          max_elapsed_time: 120s
+        sending_queue:
+          enabled: true
+          num_consumers: 8
+          queue_size: 4096
+    resolver:
+      dns:
+        # Headless Service in Kubernetes; the single gateway container in
+        # compose. Re-resolved periodically so scaling the gateway tier does
+        # not need an agent restart.
+        hostname: ${env:OTEL_GATEWAY_HOST}
+        port: 4317
+        interval: 30s
+
+  # Metrics and logs carry no trace-affinity requirement, so they take the
+  # cheaper direct path.
+  otlp/gateway:
+    endpoint: ${env:OTEL_GATEWAY_HOST}:4317
+    tls:
+      insecure: true
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 120s
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 2048
+
+service:
+  extensions: [health_check, pprof, zpages]
+  telemetry:
+    logs:
+      level: info
+      encoding: json
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resourcedetection, resource/environment, batch]
+      exporters: [loadbalancing]
+    metrics:
+      receivers: [otlp, prometheus/self]
+      processors: [memory_limiter, k8sattributes, resourcedetection, resource/environment, batch]
+      exporters: [otlp/gateway]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resourcedetection, resource/environment, batch]
+      exporters: [otlp/gateway]

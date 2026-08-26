@@ -1,0 +1,81 @@
+apiVersion: 1
+
+# Datasource UIDs are pinned. Dashboard JSON references datasources by UID, so
+# an unpinned (auto-generated) UID would break every panel the moment Grafana
+# is recreated.
+
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+
+datasources:
+  - name: Prometheus
+    uid: agentgate-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      # Must match prometheus.yml's global scrape_interval, otherwise Grafana
+      # picks $__rate_interval values that under-sample the counters.
+      timeInterval: 15s
+      manageAlerts: false
+      prometheusType: Prometheus
+      prometheusVersion: 3.1.0
+      exemplarTraceIdDestinations:
+        # Exemplars are how a spike on a latency panel becomes a specific
+        # trace. Without this mapping the operator has to guess a time range
+        # and search, which is the slow half of every investigation.
+        - name: trace_id
+          datasourceUid: agentgate-traces
+
+  - name: Traces
+    uid: agentgate-traces
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: false
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: agentgate-loki
+        spanStartTimeShift: "-2m"
+        spanEndTimeShift: "2m"
+        filterByTraceID: true
+        filterBySpanID: false
+        tags:
+          - key: service.name
+            value: service_name
+      tracesToMetrics:
+        datasourceUid: agentgate-prometheus
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        tags:
+          - key: agentgate.pool
+            value: pool
+          - key: agentgate.backend
+            value: backend
+        queries:
+          - name: Request rate for this pool
+            query: 'sum by (status) (rate(agentgate_gateway_requests_total{$$__tags}[$$__rate_interval]))'
+          - name: Cost rate for this backend
+            query: 'sum(rate(agentgate_gateway_cost_usd_total{$$__tags}[$$__rate_interval])) * 3600'
+      nodeGraph:
+        enabled: true
+
+  - name: Loki
+    uid: agentgate-loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      maxLines: 1000
+      derivedFields:
+        # The gateway logs the W3C trace id on every line; this turns it into a
+        # click-through to the trace.
+        - name: TraceID
+          matcherRegex: '"trace_id":"([a-f0-9]{32})"'
+          url: "$${__value.raw}"
+          datasourceUid: agentgate-traces

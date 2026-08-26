@@ -1,0 +1,1240 @@
+openapi: 3.1.0
+
+info:
+  title: AgentGate Fleet API
+  version: "1.0.0"
+  summary: Fleet inventory, telemetry trust, SLOs and error budgets, chargeback.
+  description: |
+    The fleet service is the observability plane's API. It joins the registry, the telemetry-trust
+    tracker, Prometheus and the cost aggregator into one view of what is running, whether it is
+    healthy, whether its telemetry can be believed, and what it costs.
+
+    The distinguishing responsibility here is **trust**. Collecting telemetry is easy and says
+    nothing. This service answers whether the traces that arrived are complete, correctly parented
+    and correctly attributed to an owning team, and it makes that answer a hard input to the
+    promotion gate through `/api/v1/signals/{id}`. A platform that only knows telemetry is "being
+    collected" cannot tell an incident from a blind spot.
+
+    ## Two consumers, one computation
+
+    `/api/v1/signals/{id}` implements the control plane's `SignalSource` contract over HTTP. The
+    promotion gate and the fleet dashboard therefore read **the same numbers**, rather than two
+    implementations of the same idea that will eventually disagree. The same principle applies to
+    the SLOs: error budgets are computed from the same recording rules the alerts fire on.
+
+    ## Availability posture
+
+    The fleet view is rebuilt every 60 seconds and served from cache for up to 90 seconds. When a
+    rebuild fails and a stale view exists, the stale view is returned rather than an error: during
+    a Prometheus outage, stale beats empty for a dashboard an on-call engineer is looking at.
+    Registry and telemetry fields stay correct in that situation; the Prometheus-derived counters
+    (`requests_last_hour`, `tokens_last_hour`, `spend_usd_last_24h`, `error_rate`) go to zero
+    rather than being marked unknown.
+
+    ## Authentication
+
+    This API is **not token-authenticated**. It is network-restricted and served behind the
+    platform's internal ingress, which performs authentication. Do not expose it to agent networks:
+    the fleet view carries every team's spend.
+
+    ## Prometheus scrape endpoint
+
+    `GET /metrics` is served on a separate operator listener, not by this API.
+  contact:
+    name: AI Platform team
+    email: ai-platform@client.example
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://fleetview.agentgate.internal
+    description: Production fleet service
+  - url: http://localhost:8082
+    description: Local development stack (docker-compose)
+
+tags:
+  - name: fleet
+    description: The fleet inventory — who owns what, running where, healthy or not.
+  - name: slo
+    description: Service level objectives and error budgets.
+  - name: telemetry
+    description: Telemetry trust — is what arrived complete and correctly attributed?
+  - name: chargeback
+    description: Cost rollups by cost centre.
+  - name: promotion
+    description: Promotion signals consumed by the control plane's gate.
+  - name: ingest
+    description: The OTLP receiver that feeds the trust tracker.
+  - name: operations
+    description: Liveness, readiness, and the operator dashboard.
+
+security: []
+
+paths:
+
+  /:
+    get:
+      tags: [operations]
+      operationId: dashboard
+      summary: The operator dashboard
+      description: |
+        A server-rendered HTML fleet dashboard for human operators. It reads the same data as
+        `/api/v1/agents`; use the JSON API for anything programmatic.
+      responses:
+        '200':
+          description: The dashboard.
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api/v1/agents:
+    get:
+      tags: [fleet]
+      operationId: fleetAgents
+      summary: The fleet view
+      description: |
+        Every registered agent, joined with its telemetry trust picture, its recent traffic and
+        error rate from Prometheus, and its spend. Sorted by identity.
+
+        Filters are applied to the already-built view, so they never change what is computed, only
+        what is returned. `env` matches agents that have at least one version in that environment.
+      parameters:
+        - name: team
+          in: query
+          description: Exact match on the owning team.
+          schema: {type: string}
+          example: payments-risk
+        - name: env
+          in: query
+          description: Agents with at least one version in this environment.
+          schema:
+            type: string
+            enum: [dev, staging, prod]
+        - name: health
+          in: query
+          description: Exact match on the computed health verdict.
+          schema:
+            type: string
+            enum: [healthy, degraded, unhealthy]
+      responses:
+        '200':
+          description: The filtered fleet view.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agents, count, generated_at]
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AgentView'
+                  count:
+                    type: integer
+                  generated_at:
+                    type: string
+                    format: date-time
+                    description: |
+                      When this response was assembled — not when the underlying view was last
+                      rebuilt. The view may be up to 90 seconds old.
+              examples:
+                fleet:
+                  value:
+                    agents:
+                      - agent_id: agt_01j8z9x2qk4m7p3r5t
+                        identity: agent://fsclient/payments-risk/dispute-triage
+                        display_name: Dispute Triage Agent
+                        team: payments-risk
+                        tenant: fsclient
+                        owner:
+                          team: payments-risk
+                          email: payments-risk@client.example
+                          oncall: PD-PAYRISK
+                          cost_center: CC-4471
+                        runtime: aks
+                        framework: langgraph
+                        data_classification: confidential
+                        versions:
+                          - version: 2.4.1
+                            env: prod
+                            state: active
+                            registered_at: "2026-08-20T08:00:00Z"
+                            promoted_at: "2026-08-26T09:41:00Z"
+                            promoted_by: a.okafor@client.example,s.mensah@client.example
+                          - version: 2.5.0
+                            env: staging
+                            state: registered
+                            registered_at: "2026-08-25T14:02:00Z"
+                        prod_version: 2.4.1
+                        pools: [general-chat]
+                        requests_last_hour: 18422
+                        tokens_last_hour: 39104882
+                        spend_usd_last_24h: 122.41
+                        spend_usd_month_to_date: 2914.08
+                        error_rate: 0.0012
+                        p95_latency_seconds: 0
+                        telemetry:
+                          agent_id: agt_01j8z9x2qk4m7p3r5t
+                          agent_identity: agent://fsclient/payments-risk/dispute-triage
+                          env: prod
+                          spans_received: 91204
+                          root_spans_received: 18310
+                          orphan_spans: 411
+                          unattributed_spans: 0
+                          gateway_requests: 18422
+                          completeness: 0.994
+                          orphan_ratio: 0.0045
+                          unattributed_ratio: 0
+                          clock_skew_p99_seconds: 0.31
+                          runtimes: [aks]
+                          last_seen: "2026-08-26T14:21:40Z"
+                        health: healthy
+                    count: 1
+                    generated_at: "2026-08-26T14:22:01Z"
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /api/v1/agents/{id}:
+    get:
+      tags: [fleet]
+      operationId: fleetAgent
+      summary: One agent's fleet row
+      description: |
+        `id` matches either the `agent_id` or the full identity URI, so a link built from either
+        works.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: '`agent_id` or `agent://tenant/team/name`.'
+          schema: {type: string}
+          example: agt_01j8z9x2qk4m7p3r5t
+      responses:
+        '200':
+          description: The agent's fleet row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentView'
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /api/v1/slo:
+    get:
+      tags: [slo]
+      operationId: sloStatus
+      summary: Service level objectives and error budgets
+      description: |
+        Evaluates each objective's good and total expressions over the SLO window and computes the
+        remaining error budget exactly, rather than approximately, by keeping numerator and
+        denominator separate.
+
+        **No traffic is not a breach.** When the denominator is zero the SLI is reported as 1 with
+        a full budget: reporting 0% availability for an idle hour is how an SLO dashboard trains
+        people to ignore it.
+
+        Results are cached for 30 seconds. A cached response omits the `window` field; a freshly
+        computed one includes it. Both always carry `objectives`.
+      responses:
+        '200':
+          description: The objectives and their current status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [objectives]
+                properties:
+                  objectives:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ObjectiveStatus'
+                  window:
+                    type: string
+                    description: |
+                      The SLO window as a Go duration string, for example `672h0m0s`. Present only
+                      on a freshly computed response; absent when served from the 30-second cache.
+              examples:
+                objectives:
+                  value:
+                    objectives:
+                      - name: gateway_availability
+                        good_expr: sum(increase(agentgate_gateway_requests_total{status!~"5..",code!="no_healthy_backend"}[28d]))
+                        total_expr: sum(increase(agentgate_gateway_requests_total{code!="client_closed_request"}[28d]))
+                        target: 0.999
+                        window: 2419200000000000
+                        description: Requests served without a platform-caused failure.
+                        runbook: docs/runbooks/gateway-availability-burn.md
+                        sli: 0.99942
+                        good_events: 12441920
+                        total_events: 12449142
+                        budget_total_events: 12449.142
+                        budget_spent_events: 7222
+                        budget_remaining_fraction: 0.4199
+                        budget_minutes_total: 40.32
+                        budget_minutes_remaining: 16.93
+                        met: true
+                        evaluated_at: "2026-08-26T14:22:01Z"
+                      - name: controlplane_token_exchange
+                        good_expr: sum(increase(agentgate_controlplane_token_exchange_total{result="success"}[28d]))
+                        total_expr: sum(increase(agentgate_controlplane_token_exchange_total[28d]))
+                        target: 0.9995
+                        window: 2419200000000000
+                        description: Token exchanges that succeeded.
+                        runbook: docs/runbooks/controlplane-token-exchange-failures.md
+                        sli: 1
+                        good_events: 0
+                        total_events: 0
+                        budget_remaining_fraction: 1
+                        met: true
+                        evaluated_at: "2026-08-26T14:22:01Z"
+                    window: 672h0m0s
+
+  /api/v1/telemetry/health:
+    get:
+      tags: [telemetry]
+      operationId: telemetryHealth
+      summary: Per-agent telemetry trust
+      description: |
+        The trust picture for every agent seen in the most recently completed observation window.
+        An agent counts as healthy when its completeness meets the bar **and** its orphan ratio is
+        below 0.05 **and** its unattributed ratio is below 0.01.
+
+        The orphan ratio is an upper bound: batching means a child span can overtake its parent, so
+        a parent that has not arrived yet is counted as an orphan and never uncounted. That is the
+        conservative direction for a trust metric.
+      responses:
+        '200':
+          description: Trust statistics for every tracked agent.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agents, healthy, unhealthy, min_completeness]
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TrustStats'
+                  healthy:
+                    type: integer
+                  unhealthy:
+                    type: integer
+                  min_completeness:
+                    type: number
+                    description: The configured completeness bar, 0.98 by default.
+              examples:
+                health:
+                  value:
+                    agents:
+                      - agent_id: agt_01j8z9x2qk4m7p3r5t
+                        agent_identity: agent://fsclient/payments-risk/dispute-triage
+                        env: prod
+                        spans_received: 91204
+                        root_spans_received: 18310
+                        orphan_spans: 411
+                        unattributed_spans: 0
+                        gateway_requests: 18422
+                        completeness: 0.994
+                        orphan_ratio: 0.0045
+                        unattributed_ratio: 0
+                        clock_skew_p99_seconds: 0.31
+                        runtimes: [aks]
+                        last_seen: "2026-08-26T14:21:40Z"
+                      - agent_id: 'unattributed:reconciliation-helper'
+                        agent_identity: ""
+                        env: staging
+                        spans_received: 2044
+                        root_spans_received: 0
+                        orphan_spans: 2044
+                        unattributed_spans: 2044
+                        gateway_requests: 0
+                        completeness: 1
+                        orphan_ratio: 1
+                        unattributed_ratio: 1
+                        clock_skew_p99_seconds: 0
+                        runtimes: []
+                        last_seen: "2026-08-26T14:20:02Z"
+                        missing_attributes:
+                          - agentgate.agent.id
+                          - agentgate.cost_center
+                          - agentgate.team.id
+                    healthy: 1
+                    unhealthy: 1
+                    min_completeness: 0.98
+
+  /api/v1/chargeback:
+    get:
+      tags: [chargeback]
+      operationId: chargeback
+      summary: Cost rollups by cost centre
+      description: |
+        Aggregated usage, sorted by cost descending. Rollups come from the in-process aggregator;
+        when it has nothing for the requested period the local usage journal is read instead, so a
+        chargeback report can be produced in a disconnected environment and so the local stack
+        demonstrates the whole path end to end.
+
+        `savings_usd` is what cache hits avoided spending. A shared platform that can only report
+        what it cost, and never what it saved, is a shared platform that will eventually be asked
+        to stop spending.
+      parameters:
+        - name: period
+          in: query
+          description: Rollup granularity. Any value other than `hour` buckets by day.
+          schema:
+            type: string
+            enum: [hour, day]
+            default: day
+        - name: cost_center
+          in: query
+          description: Restrict to one cost centre. Omit for all.
+          schema: {type: string}
+          example: CC-4471
+      responses:
+        '200':
+          description: The rollups and their totals.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [period, rollups, by_cost_center, total_usd, savings_usd, generated_at]
+                properties:
+                  period:
+                    type: string
+                  rollups:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Rollup'
+                  by_cost_center:
+                    type: object
+                    additionalProperties:
+                      type: number
+                      format: double
+                    description: Total cost per cost centre.
+                  total_usd:
+                    type: number
+                    format: double
+                  savings_usd:
+                    type: number
+                    format: double
+                  generated_at:
+                    type: string
+                    format: date-time
+              examples:
+                daily:
+                  value:
+                    period: day
+                    rollups:
+                      - period: day
+                        start: "2026-08-26T00:00:00Z"
+                        end: "2026-08-27T00:00:00Z"
+                        env: prod
+                        tenant: fsclient
+                        team: payments-risk
+                        agent_id: agt_01j8z9x2qk4m7p3r5t
+                        cost_center: CC-4471
+                        requests: 412884
+                        input_tokens: 761204882
+                        output_tokens: 128440221
+                        cost_usd: 191.44
+                        savings_usd: 22.08
+                        cache_hits: 41220
+                        errors: 502
+                    by_cost_center:
+                      CC-4471: 191.44
+                    total_usd: 191.44
+                    savings_usd: 22.08
+                    generated_at: "2026-08-26T14:22:01Z"
+
+  /api/v1/signals/{id}:
+    get:
+      tags: [promotion]
+      operationId: agentSignals
+      summary: Promotion signals for one agent
+      description: |
+        The observed behaviour of one agent in one environment, as the promotion gate consumes it.
+        The registry deliberately does not compute these: the plane that owns whether telemetry is
+        trustworthy is the plane that answers whether it is good enough to promote.
+
+        A gate that cannot read its signals refuses the promotion rather than assuming: an error
+        here blocks, it does not default.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The `agent_id`.
+          schema: {type: string}
+          example: agt_01j8z9x2qk4m7p3r5t
+        - name: env
+          in: query
+          description: The source environment the gate is promoting from. Defaults to `staging`.
+          schema:
+            type: string
+            enum: [dev, staging, prod]
+            default: staging
+      responses:
+        '200':
+          description: The signals.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentSignals'
+              examples:
+                signals:
+                  value:
+                    request_count: 41220
+                    telemetry_completeness: 0.994
+                    success_ratio: 0.9987
+                    success_objective: 0.99
+                    critical_guardrail_hits: 0
+                    observed_attestation: workload-identity
+                    projected_monthly_cost_usd: 1841.22
+                    team_monthly_budget_usd: 0
+                    team_token_envelope_per_min: 0
+                    security_review_ref: CHG0048221
+                    window_seconds: 86400
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /v1/traces:
+    post:
+      tags: [ingest]
+      operationId: ingestTraces
+      summary: OTLP/HTTP JSON trace receiver
+      description: |
+        The trust tracker's ingest endpoint. The OpenTelemetry Collector is configured to fan a
+        **copy** of the trace pipeline here; this is not the primary trace destination.
+
+        It receives a copy of the stream rather than querying the tracing backend, because querying
+        the backend would make the trust signal depend on the very component whose health it is
+        supposed to report. A backend dropping data would otherwise report perfect completeness
+        right up until someone noticed by hand.
+
+        The body is an OTLP/HTTP **JSON** `ExportTraceServiceRequest`. Protobuf encoding is not
+        accepted. Only the fields the tracker reads are modelled — resource attributes, span id,
+        parent span id, and start time — so a collector adding fields does not break ingestion. The
+        body is read under a 32 MiB limit.
+
+        Spans whose resource attributes lack `agentgate.agent.id` are bucketed under
+        `unattributed:<service.name>` rather than dropped, which is what makes an unattributed
+        agent visible instead of invisible.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OTLPTraceRequest'
+            examples:
+              minimal:
+                summary: One resource, one span
+                value:
+                  resourceSpans:
+                    - resource:
+                        attributes:
+                          - key: service.name
+                            value: {stringValue: dispute-triage}
+                          - key: deployment.environment.name
+                            value: {stringValue: prod}
+                          - key: agentgate.agent.id
+                            value: {stringValue: agt_01j8z9x2qk4m7p3r5t}
+                          - key: agentgate.agent.identity
+                            value: {stringValue: 'agent://fsclient/payments-risk/dispute-triage'}
+                          - key: agentgate.team.id
+                            value: {stringValue: payments-risk}
+                          - key: agentgate.cost_center
+                            value: {stringValue: CC-4471}
+                          - key: agentgate.runtime
+                            value: {stringValue: aks}
+                      scopeSpans:
+                        - spans:
+                            - traceId: 4bf92f3577b34da6a3ce929d0e0e4736
+                              spanId: 00f067aa0ba902b7
+                              parentSpanId: ""
+                              name: agent.invoke
+                              startTimeUnixNano: "1774526521000000000"
+                              attributes: []
+      responses:
+        '200':
+          description: |
+            Spans accepted. `partialSuccess` is always an empty object: the tracker either parses
+            the payload or rejects it whole.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [partialSuccess, spansAccepted]
+                properties:
+                  partialSuccess:
+                    type: object
+                    additionalProperties: true
+                  spansAccepted:
+                    type: integer
+              examples:
+                accepted:
+                  value:
+                    partialSuccess: {}
+                    spansAccepted: 1
+        '400':
+          description: |
+            The body could not be read, or is not valid OTLP JSON. The response is `text/plain`,
+            not problem+json: this endpoint speaks the OTLP receiver's dialect, not AgentGate's.
+          content:
+            text/plain:
+              schema:
+                type: string
+              examples:
+                invalid:
+                  value: invalid OTLP JSON payload
+
+  /healthz:
+    get:
+      tags: [operations]
+      operationId: fleetLiveness
+      summary: Liveness probe
+      description: Reports that the process is running. Depends on nothing downstream.
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, version]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  version:
+                    $ref: '#/components/schemas/VersionInfo'
+
+  /readyz:
+    get:
+      tags: [operations]
+      operationId: fleetReadiness
+      summary: Readiness probe
+      description: |
+        Ready when the registry answers a list query. Prometheus being unreachable does **not**
+        make the service unready: a stale fleet view is still worth serving, and taking the
+        dashboard away during an observability outage is exactly the wrong moment to do it.
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetReadiness'
+              examples:
+                ready:
+                  value:
+                    status: ready
+                    checks:
+                      registry: true
+        '503':
+          description: Not ready — the registry is unreachable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetReadiness'
+              examples:
+                notReady:
+                  value:
+                    status: not_ready
+                    checks:
+                      registry: false
+
+components:
+
+  schemas:
+
+    Owner:
+      type: object
+      description: The accountable team, carried through from the registry.
+      required: [team, email, oncall, cost_center]
+      properties:
+        team: {type: string}
+        email: {type: string}
+        oncall: {type: string}
+        cost_center: {type: string}
+        manager: {type: string}
+      additionalProperties: false
+
+    Version:
+      type: object
+      description: |
+        One deployable version, carried through from the registry. See `controlplane.v1.yaml` for
+        the full field semantics; the same schema is served here.
+      required: [version, env, state, registered_at]
+      properties:
+        version: {type: string}
+        env:
+          type: string
+          enum: [dev, staging, prod]
+        state:
+          type: string
+          enum: [registered, active, pending_promotion, blocked, retired, quarantined]
+        image: {type: string}
+        commit_sha: {type: string}
+        registered_at: {type: string, format: date-time}
+        registered_by: {type: string}
+        promoted_at:
+          type: [string, 'null']
+          format: date-time
+        promoted_by: {type: string}
+        retired_at:
+          type: [string, 'null']
+          format: date-time
+        last_gate:
+          description: The most recent gate evaluation snapshot for this version.
+          type: [object, 'null']
+          additionalProperties: true
+        notes: {type: string}
+      additionalProperties: false
+
+    TrustStats:
+      type: object
+      description: |
+        One agent's telemetry trust picture over the most recently completed observation window
+        (five minutes by default).
+      required:
+        - agent_id
+        - agent_identity
+        - env
+        - spans_received
+        - root_spans_received
+        - orphan_spans
+        - unattributed_spans
+        - gateway_requests
+        - completeness
+        - orphan_ratio
+        - unattributed_ratio
+        - clock_skew_p99_seconds
+        - runtimes
+        - last_seen
+      properties:
+        agent_id:
+          type: string
+          description: |
+            The `agentgate.agent.id` resource attribute, or `unattributed:<service.name>` when the
+            spans carried no agent id.
+        agent_identity:
+          type: string
+          description: The `agentgate.agent.identity` resource attribute. Empty when not reported.
+        env: {type: string}
+        spans_received: {type: integer, format: int64}
+        root_spans_received:
+          type: integer
+          format: int64
+          description: |
+            Spans with no parent. This is the numerator of completeness: one root span per gateway
+            request is what a complete trace looks like.
+        orphan_spans:
+          type: integer
+          format: int64
+          description: |
+            Spans whose parent had not been seen when they arrived. An **upper bound** — a parent
+            that lands later is never uncounted.
+        unattributed_spans:
+          type: integer
+          format: int64
+          description: |
+            Spans from a resource missing one or more of `service.name`,
+            `deployment.environment.name`, `agentgate.agent.id`, `agentgate.team.id`,
+            `agentgate.cost_center`.
+        gateway_requests:
+          type: integer
+          format: int64
+          description: |
+            The completeness denominator, taken from the gateway's own request counter rather than
+            from the trace stream, so that a total collector outage shows as zero completeness
+            rather than as no data at all.
+        completeness:
+          type: number
+          format: double
+          description: |
+            `root_spans_received / gateway_requests`, capped at 1. When no expectation has been
+            recorded yet but well-formed spans are arriving, reported as 1 — that is the best
+            available evidence.
+        orphan_ratio: {type: number, format: double}
+        unattributed_ratio: {type: number, format: double}
+        clock_skew_p99_seconds:
+          type: number
+          format: double
+          description: |
+            p99 of the gap between a span's claimed start time and its arrival, counted only where
+            the span claims to start in the future. Skew in that direction misorders traces.
+        runtimes:
+          type: array
+          items: {type: string}
+          description: Distinct `agentgate.runtime` values seen for this agent, sorted.
+        last_seen: {type: string, format: date-time}
+        missing_attributes:
+          type: array
+          items: {type: string}
+          description: |
+            Which required resource attributes were absent, sorted. This is the actionable half of
+            an unattributed ratio: it names what the owning team has to add.
+      additionalProperties: false
+
+    AgentView:
+      type: object
+      description: |
+        One row of the fleet view: who owns an agent, what version is where, whether it is healthy,
+        what it consumes and who pays for it.
+      required:
+        - agent_id
+        - identity
+        - display_name
+        - team
+        - tenant
+        - owner
+        - runtime
+        - data_classification
+        - versions
+        - pools
+        - requests_last_hour
+        - tokens_last_hour
+        - spend_usd_last_24h
+        - spend_usd_month_to_date
+        - error_rate
+        - p95_latency_seconds
+        - telemetry
+        - health
+      properties:
+        agent_id: {type: string}
+        identity: {type: string}
+        display_name: {type: string}
+        team: {type: string}
+        tenant: {type: string}
+        owner:
+          $ref: '#/components/schemas/Owner'
+        runtime: {type: string}
+        framework: {type: string}
+        data_classification:
+          type: string
+          enum: [public, internal, confidential, restricted]
+        versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Version'
+        prod_version:
+          type: string
+          description: The version currently `active` in production. Absent when there is none.
+        pools:
+          type: array
+          items: {type: string}
+          description: The production pool grant.
+        requests_last_hour:
+          type: integer
+          format: int64
+          description: |
+            From Prometheus, for the agent's most significant environment — production when a
+            production version is active, otherwise the highest environment it appears in. Zero
+            when Prometheus is unreachable.
+        tokens_last_hour: {type: integer, format: int64}
+        spend_usd_last_24h: {type: number, format: double}
+        spend_usd_month_to_date:
+          type: number
+          format: double
+          description: Summed from the cost aggregator's daily rollups for the owning cost centre.
+        error_rate:
+          type: number
+          format: double
+          description: 5xx responses as a fraction of requests over the last hour.
+        p95_latency_seconds:
+          type: number
+          format: double
+          description: |
+            Reserved. The fleet view does not currently populate this from Prometheus and it is
+            reported as 0. It is part of the response shape so that adding it later is additive.
+        telemetry:
+          $ref: '#/components/schemas/TrustStats'
+        health:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+          description: |
+            A deliberately opinionated verdict. `unhealthy` is set by gateway traffic with no
+            traces, an error rate above 5%, or a quarantined version. `degraded` is set by a
+            missing on-call rotation or cost centre, production without a linked security review,
+            trace completeness below the bar, more than 1% unattributed spans, or clock skew above
+            5 seconds. A fleet view that reports everything as green until it is on fire is a
+            decoration.
+        issues:
+          type: array
+          items: {type: string}
+          description: The specific findings behind the verdict, in the words an owner has to act on.
+      additionalProperties: false
+
+    Objective:
+      type: object
+      description: |
+        One service level objective. `good_expr` and `total_expr` are PromQL over the SLO window;
+        keeping numerator and denominator separate is what allows the error-budget arithmetic to be
+        exact rather than approximate.
+      required: [name, good_expr, total_expr, target, window, description, runbook]
+      properties:
+        name:
+          type: string
+          enum:
+            - gateway_availability
+            - gateway_overhead_latency
+            - gateway_ttft
+            - controlplane_token_exchange
+        good_expr: {type: string}
+        total_expr: {type: string}
+        target:
+          type: number
+          format: double
+          description: The objective as a fraction, for example 0.999.
+        window:
+          type: integer
+          format: int64
+          description: |
+            The SLO window in **nanoseconds**. It is a Go `time.Duration` serialised as JSON, which
+            is an integer count of nanoseconds; 28 days is `2419200000000000`.
+        description: {type: string}
+        runbook:
+          type: string
+          description: Repository-relative path to the runbook the alert annotation links to.
+      additionalProperties: false
+
+    ObjectiveStatus:
+      allOf:
+        - $ref: '#/components/schemas/Objective'
+        - type: object
+          description: |
+            A computed objective. The `Objective` fields are inlined, not nested: the Go type
+            embeds the objective.
+          required:
+            - sli
+            - good_events
+            - total_events
+            - budget_total_events
+            - budget_spent_events
+            - budget_remaining_fraction
+            - budget_minutes_total
+            - budget_minutes_remaining
+            - met
+            - evaluated_at
+          properties:
+            sli:
+              type: number
+              format: double
+              description: '`good_events / total_events`. Reported as 1 when there was no traffic.'
+            good_events: {type: number, format: double}
+            total_events: {type: number, format: double}
+            budget_total_events:
+              type: number
+              format: double
+              description: '`(1 - target) * total_events` — how many failures the budget allows.'
+            budget_spent_events:
+              type: number
+              format: double
+              description: '`total_events - good_events`.'
+            budget_remaining_fraction:
+              type: number
+              format: double
+              description: Clamped at 0. Never negative, however far the objective has been missed.
+            budget_minutes_total:
+              type: number
+              format: double
+              description: '`window_minutes * (1 - target)` — the budget expressed as downtime.'
+            budget_minutes_remaining: {type: number, format: double}
+            met: {type: boolean}
+            error:
+              type: string
+              description: |
+                Present when the objective could not be evaluated, typically because Prometheus was
+                unreachable. When it is present the numeric fields are zero and must not be read as
+                a breach.
+            evaluated_at: {type: string, format: date-time}
+
+    Rollup:
+      type: object
+      description: An aggregated slice of usage, bucketed by period and by rollup key.
+      required:
+        - period
+        - start
+        - end
+        - env
+        - tenant
+        - team
+        - agent_id
+        - cost_center
+        - requests
+        - input_tokens
+        - output_tokens
+        - cost_usd
+        - savings_usd
+        - cache_hits
+        - errors
+      properties:
+        period:
+          type: string
+          description: '`hour` or `day`.'
+        start: {type: string, format: date-time}
+        end: {type: string, format: date-time}
+        env: {type: string}
+        tenant: {type: string}
+        team: {type: string}
+        agent_id: {type: string}
+        cost_center: {type: string}
+        requests: {type: integer, format: int64}
+        input_tokens: {type: integer, format: int64}
+        output_tokens: {type: integer, format: int64}
+        cost_usd:
+          type: number
+          format: double
+          description: Billable cost. Cache hits contribute 0 here and their value to `savings_usd`.
+        savings_usd:
+          type: number
+          format: double
+          description: What cache hits would have cost had they reached a provider.
+        cache_hits: {type: integer, format: int64}
+        errors:
+          type: integer
+          format: int64
+          description: Records carrying a non-empty error code.
+      additionalProperties: false
+
+    AgentSignals:
+      type: object
+      description: |
+        The promotion gate's input: one number per automated gate that needs an observation, plus
+        the thresholds those gates compare against.
+
+        Each field below names the gate it feeds, because a field whose effect on the promotion
+        decision is not obvious is a field someone will eventually misread.
+      required:
+        - request_count
+        - telemetry_completeness
+        - success_ratio
+        - success_objective
+        - critical_guardrail_hits
+        - observed_attestation
+        - projected_monthly_cost_usd
+        - team_monthly_budget_usd
+        - team_token_envelope_per_min
+        - window_seconds
+      properties:
+        request_count:
+          type: integer
+          format: int64
+          description: |
+            Gateway requests observed in the source environment. Taken from the trust tracker when
+            it has a figure, otherwise from Prometheus over 24 hours. Feeds `telemetry_healthy`,
+            which requires at least 100 — a completeness ratio over a handful of requests is noise,
+            not evidence.
+        telemetry_completeness:
+          type: number
+          format: double
+          description: |
+            0..1. Feeds `telemetry_healthy`, which requires at least 0.95. This is the gate that
+            makes the observability plane load-bearing rather than decorative.
+        success_ratio:
+          type: number
+          format: double
+          description: |
+            0..1, non-5xx over total across 24 hours in the source environment. Feeds
+            `error_budget`.
+        success_objective:
+          type: number
+          format: double
+          description: |
+            The objective `success_ratio` is compared against by `error_budget`. Currently a fixed
+            0.99 for every agent; a per-agent objective would be set here.
+        critical_guardrail_hits:
+          type: integer
+          format: int64
+          description: |
+            Guardrail `block` decisions over the last 7 days. Feeds `guardrail_clean`, which
+            requires 0.
+        observed_attestation:
+          type: string
+          enum: ["", workload-identity, client-secret, developer]
+          description: |
+            How the agent last authenticated in the source environment. Feeds `identity_attested`:
+            production requires `workload-identity`, lower environments require only that something
+            non-empty was observed. An empty string means the agent has never obtained a token in
+            that environment.
+        projected_monthly_cost_usd:
+          type: number
+          format: double
+          description: Seven-day spend extrapolated to thirty days. Feeds `cost_projection`.
+        team_monthly_budget_usd:
+          type: number
+          format: double
+          description: |
+            The team's budget, compared against `projected_monthly_cost_usd` by `cost_projection`.
+            **Zero means no budget is configured and the gate passes unconditionally.** It does not
+            mean a budget of zero.
+        team_token_envelope_per_min:
+          type: integer
+          format: int64
+          description: |
+            The team's tokens-per-minute envelope, compared against the agent's declared quota by
+            `quota_declared`. Zero means no envelope is configured and the gate passes
+            unconditionally.
+        security_review_ref:
+          type: string
+          description: |
+            Carried through from the agent record. Feeds `security_review`, which runs for
+            production targets only. Omitted when empty.
+        security_review_expires_at:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            When the security review reference lapses. Omitted or null means it does not expire,
+            which `security_review` treats as valid.
+        window_seconds:
+          type: integer
+          format: int64
+          description: |
+            The observation window in **seconds**. 24 hours is `86400`. Seconds rather than a Go
+            duration so the value is readable by a consumer that is not written in Go.
+      additionalProperties: false
+
+    OTLPAnyValue:
+      type: object
+      description: |
+        The OTLP attribute value union. Only the four scalar forms the tracker reads are modelled;
+        others are accepted and ignored.
+      properties:
+        stringValue: {type: string}
+        intValue:
+          type: string
+          description: OTLP/JSON encodes 64-bit integers as strings.
+        boolValue: {type: boolean}
+        doubleValue: {type: number, format: double}
+      additionalProperties: true
+
+    OTLPKeyValue:
+      type: object
+      required: [key, value]
+      properties:
+        key: {type: string}
+        value:
+          $ref: '#/components/schemas/OTLPAnyValue'
+      additionalProperties: false
+
+    OTLPSpan:
+      type: object
+      description: |
+        Only the span fields the trust tracker reads. A collector sending the full OTLP span is
+        correct; the extra fields are ignored.
+      properties:
+        traceId: {type: string, description: Lower-case hex, 32 characters.}
+        spanId: {type: string, description: Lower-case hex, 16 characters.}
+        parentSpanId:
+          type: string
+          description: Empty on a root span. Root spans are the completeness numerator.
+        name: {type: string}
+        startTimeUnixNano:
+          type: string
+          description: Unix nanoseconds as a decimal string. Used for the clock-skew statistic.
+        attributes:
+          type: array
+          items:
+            $ref: '#/components/schemas/OTLPKeyValue'
+      additionalProperties: true
+
+    OTLPTraceRequest:
+      type: object
+      description: An OTLP/HTTP JSON `ExportTraceServiceRequest`, reduced to the fields read.
+      required: [resourceSpans]
+      properties:
+        resourceSpans:
+          type: array
+          items:
+            type: object
+            properties:
+              resource:
+                type: object
+                properties:
+                  attributes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OTLPKeyValue'
+                additionalProperties: true
+              scopeSpans:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    spans:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/OTLPSpan'
+                  additionalProperties: true
+            additionalProperties: true
+      additionalProperties: true
+
+    VersionInfo:
+      type: object
+      required: [version, commit, build_date, go_version, platform]
+      properties:
+        version: {type: string}
+        commit: {type: string}
+        build_date: {type: string}
+        go_version: {type: string}
+        platform: {type: string}
+      additionalProperties: false
+
+    FleetReadiness:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        checks:
+          type: object
+          properties:
+            registry: {type: boolean}
+          additionalProperties: true
+      additionalProperties: false
+
+    Problem:
+      type: object
+      description: RFC 9457 problem details. The same document shape the gateway returns.
+      required: [type, title, status, code]
+      properties:
+        type: {type: string, format: uri}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        code: {type: string}
+        request_id: {type: string}
+        trace_id: {type: string}
+      additionalProperties: true
+
+  responses:
+
+    NotFound:
+      description: '`404 not_found` — no agent matches the id or identity.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            unknown:
+              value:
+                type: https://agentgate.internal/errors/not_found
+                title: Not found
+                status: 404
+                detail: unknown agent "agt_nope"
+                code: not_found
+
+    InternalError:
+      description: |
+        `500 internal_error` — the fleet view could not be built and no stale view was available to
+        serve instead.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            buildFailed:
+              value:
+                type: https://agentgate.internal/errors/internal_error
+                title: Internal error
+                status: 500
+                detail: 'could not build the fleet view: registry unavailable'
+                code: internal_error

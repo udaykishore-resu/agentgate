@@ -1,0 +1,619 @@
+# AgentGate — SLI recording rules and multi-window multi-burn-rate alerts.
+# Implements SPEC §5.
+#
+# ---------------------------------------------------------------------------
+# Metric naming
+# ---------------------------------------------------------------------------
+# SPEC §4.3 names metrics in OTel form (`agentgate.gateway.requests`). The
+# Prometheus exporter normalises those to `agentgate_gateway_requests_total`,
+# and histograms carry their unit, so `agentgate.gateway.duration` (seconds)
+# becomes `agentgate_gateway_duration_seconds_bucket`. Two SLIs in SPEC §5 are
+# measured on series that the gateway and control plane export in addition to
+# the §4.3 table, because the SLI is defined on something the table does not
+# expose directly:
+#
+#   agentgate_gateway_overhead_seconds_*        gateway time EXCLUDING provider
+#                                               time (labels: env, pool, stream)
+#   agentgate_controlplane_token_exchange_total {env, result}
+#   agentgate_controlplane_token_exchange_duration_seconds_*
+#   agentgate_fleet_cost_anomalies_total        {env, surfaced_by="platform"|"team"}
+#
+# ---------------------------------------------------------------------------
+# Burn-rate arithmetic (28-day SLO window, per SPEC §5)
+# ---------------------------------------------------------------------------
+# burn_rate = budget_fraction_consumed x window_period / alert_window
+#
+#   2%  of budget in 1h  -> 0.02 x 672h / 1h  = 13.44   page  (short window  5m)
+#   5%  of budget in 6h  -> 0.05 x 672h / 6h  =  5.60   page  (short window 30m)
+#   10% of budget in 3d  -> 0.10 x 672h / 72h =  0.9333 ticket(short window  6h)
+#
+# The short window is the second condition on every alert. It exists so the
+# alert RESOLVES promptly once the burn stops: a 6h window alone stays firing
+# for six hours after an incident ends, which trains people to ignore it.
+# ---------------------------------------------------------------------------
+
+groups:
+
+  # =========================================================================
+  # SLI 1 — Gateway availability. Objective 99.9% over 28d (budget 40m19s).
+  # Good = neither a 5xx nor a `no_healthy_backend`. Client errors (4xx) are
+  # excluded from "bad" on purpose: a caller sending an oversized prompt is not
+  # the platform failing, and counting it as such makes the SLO unactionable.
+  # =========================================================================
+  - name: agentgate.sli.gateway_availability
+    interval: 15s
+    rules:
+      - record: agentgate:gateway_requests:rate5m
+        expr: |
+          sum by (env) (rate(agentgate_gateway_requests_total[5m]))
+      - record: agentgate:gateway_requests_bad:rate5m
+        expr: |
+          sum by (env) (rate(agentgate_gateway_requests_total{status=~"5.."}[5m]))
+          + sum by (env) (rate(agentgate_gateway_requests_total{code="no_healthy_backend",status!~"5.."}[5m]))
+      - record: agentgate:gateway_availability:error_ratio_rate5m
+        expr: |
+          agentgate:gateway_requests_bad:rate5m
+          / clamp_min(agentgate:gateway_requests:rate5m, 1e-9)
+
+      - record: agentgate:gateway_requests:rate30m
+        expr: |
+          sum by (env) (rate(agentgate_gateway_requests_total[30m]))
+      - record: agentgate:gateway_requests_bad:rate30m
+        expr: |
+          sum by (env) (rate(agentgate_gateway_requests_total{status=~"5.."}[30m]))
+          + sum by (env) (rate(agentgate_gateway_requests_total{code="no_healthy_backend",status!~"5.."}[30m]))
+      - record: agentgate:gateway_availability:error_ratio_rate30m
+        expr: |
+          agentgate:gateway_requests_bad:rate30m
+          / clamp_min(agentgate:gateway_requests:rate30m, 1e-9)
+
+      - record: agentgate:gateway_requests:rate1h
+        expr: |
+          sum by (env) (rate(agentgate_gateway_requests_total[1h]))
+      - record: agentgate:gateway_requests_bad:rate1h
+        expr: |
+          sum by (env) (rate(agentgate_gateway_requests_total{status=~"5.."}[1h]))
+          + sum by (env) (rate(agentgate_gateway_requests_total{code="no_healthy_backend",status!~"5.."}[1h]))
+      - record: agentgate:gateway_availability:error_ratio_rate1h
+        expr: |
+          agentgate:gateway_requests_bad:rate1h
+          / clamp_min(agentgate:gateway_requests:rate1h, 1e-9)
+
+      - record: agentgate:gateway_requests:rate6h
+        expr: |
+          sum by (env) (rate(agentgate_gateway_requests_total[6h]))
+      - record: agentgate:gateway_requests_bad:rate6h
+        expr: |
+          sum by (env) (rate(agentgate_gateway_requests_total{status=~"5.."}[6h]))
+          + sum by (env) (rate(agentgate_gateway_requests_total{code="no_healthy_backend",status!~"5.."}[6h]))
+      - record: agentgate:gateway_availability:error_ratio_rate6h
+        expr: |
+          agentgate:gateway_requests_bad:rate6h
+          / clamp_min(agentgate:gateway_requests:rate6h, 1e-9)
+
+      - record: agentgate:gateway_requests:rate3d
+        expr: |
+          sum by (env) (rate(agentgate_gateway_requests_total[3d]))
+      - record: agentgate:gateway_requests_bad:rate3d
+        expr: |
+          sum by (env) (rate(agentgate_gateway_requests_total{status=~"5.."}[3d]))
+          + sum by (env) (rate(agentgate_gateway_requests_total{code="no_healthy_backend",status!~"5.."}[3d]))
+      - record: agentgate:gateway_availability:error_ratio_rate3d
+        expr: |
+          agentgate:gateway_requests_bad:rate3d
+          / clamp_min(agentgate:gateway_requests:rate3d, 1e-9)
+
+      # Dashboard series: fraction of the 28d error budget still unspent.
+      # Evaluated on the slow group below because a 28d rate is expensive.
+      - record: agentgate:gateway_availability:objective
+        expr: vector(0.999)
+
+  - name: agentgate.sli.gateway_availability.slow
+    interval: 5m
+    rules:
+      - record: agentgate:gateway_availability:error_ratio_rate28d
+        expr: |
+          (
+            sum by (env) (rate(agentgate_gateway_requests_total{status=~"5.."}[28d]))
+            + sum by (env) (rate(agentgate_gateway_requests_total{code="no_healthy_backend",status!~"5.."}[28d]))
+          )
+          / clamp_min(sum by (env) (rate(agentgate_gateway_requests_total[28d])), 1e-9)
+      - record: agentgate:gateway_availability:error_budget_remaining_ratio
+        expr: |
+          clamp_min(1 - (agentgate:gateway_availability:error_ratio_rate28d / 0.001), 0)
+
+  # =========================================================================
+  # SLI 2 — Gateway latency (unary). p95 gateway OVERHEAD < 60ms, 99% of
+  # minutes. Overhead excludes provider time: the platform is accountable for
+  # what it adds, not for how long Azure OpenAI took to generate 900 tokens.
+  # =========================================================================
+  - name: agentgate.sli.gateway_latency
+    interval: 15s
+    rules:
+      - record: agentgate:gateway_overhead:p95_1m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (env, le) (rate(agentgate_gateway_overhead_seconds_bucket{stream="false"}[1m]))
+          )
+      # Boolean per evaluation: 1 = this minute violated the objective.
+      # `> bool` yields 0/1 so avg_over_time gives the bad-minute fraction
+      # directly, which is exactly the SLI SPEC §5 defines.
+      - record: agentgate:gateway_latency:bad_minute
+        expr: |
+          (agentgate:gateway_overhead:p95_1m > bool 0.060)
+      - record: agentgate:gateway_latency:bad_ratio_rate5m
+        expr: avg_over_time(agentgate:gateway_latency:bad_minute[5m])
+      - record: agentgate:gateway_latency:bad_ratio_rate30m
+        expr: avg_over_time(agentgate:gateway_latency:bad_minute[30m])
+      - record: agentgate:gateway_latency:bad_ratio_rate1h
+        expr: avg_over_time(agentgate:gateway_latency:bad_minute[1h])
+      - record: agentgate:gateway_latency:bad_ratio_rate6h
+        expr: avg_over_time(agentgate:gateway_latency:bad_minute[6h])
+      - record: agentgate:gateway_latency:bad_ratio_rate3d
+        expr: avg_over_time(agentgate:gateway_latency:bad_minute[3d])
+
+      # Per-pool p95s for the dashboard; not alerted on directly because a
+      # single low-volume pool would page on three slow requests.
+      - record: agentgate:gateway_overhead:p95_5m_by_pool
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (env, pool, le) (rate(agentgate_gateway_overhead_seconds_bucket[5m]))
+          )
+      - record: agentgate:gateway_duration:p95_5m_by_pool
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (env, pool, le) (rate(agentgate_gateway_duration_seconds_bucket[5m]))
+          )
+
+  # =========================================================================
+  # SLI 3 — Gateway TTFT (streaming). p95 time-to-first-token < 1200ms, 99%.
+  # TTFT is the number a chat user actually feels; total duration is not.
+  # =========================================================================
+  - name: agentgate.sli.gateway_ttft
+    interval: 15s
+    rules:
+      - record: agentgate:gateway_ttft:p95_1m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (env, le) (rate(agentgate_gateway_ttft_seconds_bucket[1m]))
+          )
+      - record: agentgate:gateway_ttft:bad_minute
+        expr: |
+          (agentgate:gateway_ttft:p95_1m > bool 1.200)
+      - record: agentgate:gateway_ttft:bad_ratio_rate5m
+        expr: avg_over_time(agentgate:gateway_ttft:bad_minute[5m])
+      - record: agentgate:gateway_ttft:bad_ratio_rate30m
+        expr: avg_over_time(agentgate:gateway_ttft:bad_minute[30m])
+      - record: agentgate:gateway_ttft:bad_ratio_rate1h
+        expr: avg_over_time(agentgate:gateway_ttft:bad_minute[1h])
+      - record: agentgate:gateway_ttft:bad_ratio_rate6h
+        expr: avg_over_time(agentgate:gateway_ttft:bad_minute[6h])
+      - record: agentgate:gateway_ttft:p95_5m_by_backend
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (env, pool, backend, le) (rate(agentgate_gateway_ttft_seconds_bucket[5m]))
+          )
+
+  # =========================================================================
+  # SLI 4 — Control plane token exchange. 99.95% success, p95 < 150ms.
+  # A token-exchange outage stops every NEW agent process from starting while
+  # existing ones keep running on unexpired tokens, so it looks quiet for
+  # minutes and then becomes a fleet-wide outage. Hence the tighter objective.
+  # =========================================================================
+  - name: agentgate.sli.controlplane
+    interval: 15s
+    rules:
+      - record: agentgate:controlplane_token_exchange:error_ratio_rate5m
+        expr: |
+          sum by (env) (rate(agentgate_controlplane_token_exchange_total{result!="success"}[5m]))
+          / clamp_min(sum by (env) (rate(agentgate_controlplane_token_exchange_total[5m])), 1e-9)
+      - record: agentgate:controlplane_token_exchange:error_ratio_rate30m
+        expr: |
+          sum by (env) (rate(agentgate_controlplane_token_exchange_total{result!="success"}[30m]))
+          / clamp_min(sum by (env) (rate(agentgate_controlplane_token_exchange_total[30m])), 1e-9)
+      - record: agentgate:controlplane_token_exchange:error_ratio_rate1h
+        expr: |
+          sum by (env) (rate(agentgate_controlplane_token_exchange_total{result!="success"}[1h]))
+          / clamp_min(sum by (env) (rate(agentgate_controlplane_token_exchange_total[1h])), 1e-9)
+      - record: agentgate:controlplane_token_exchange:error_ratio_rate6h
+        expr: |
+          sum by (env) (rate(agentgate_controlplane_token_exchange_total{result!="success"}[6h]))
+          / clamp_min(sum by (env) (rate(agentgate_controlplane_token_exchange_total[6h])), 1e-9)
+      - record: agentgate:controlplane_token_exchange:error_ratio_rate3d
+        expr: |
+          sum by (env) (rate(agentgate_controlplane_token_exchange_total{result!="success"}[3d]))
+          / clamp_min(sum by (env) (rate(agentgate_controlplane_token_exchange_total[3d])), 1e-9)
+      - record: agentgate:controlplane_token_exchange:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (env, le) (rate(agentgate_controlplane_token_exchange_duration_seconds_bucket[5m]))
+          )
+
+  # =========================================================================
+  # SLI 5 — Telemetry completeness (SPEC §4.5). Per-agent completeness >= 0.98
+  # for 99% of agents. This is the trust metric for the observability plane
+  # itself and a hard input to the promotion gate, so it is an SLI, not a
+  # nice-to-have dashboard number.
+  # =========================================================================
+  - name: agentgate.sli.telemetry_completeness
+    interval: 30s
+    rules:
+      - record: agentgate:telemetry_completeness:agents_total
+        expr: count by (env) (agentgate_telemetry_completeness)
+      - record: agentgate:telemetry_completeness:agents_below_objective
+        expr: count by (env) (agentgate_telemetry_completeness < 0.98)
+      - record: agentgate:telemetry_completeness:agents_below_objective_ratio
+        expr: |
+          clamp_min(agentgate:telemetry_completeness:agents_below_objective, 0)
+          / clamp_min(agentgate:telemetry_completeness:agents_total, 1)
+      - record: agentgate:telemetry_completeness:fleet_p05
+        expr: quantile by (env) (0.05, agentgate_telemetry_completeness)
+
+  # =========================================================================
+  # SLI 6 — Cost anomaly detection. 95% of anomalies surfaced by the platform
+  # before the consuming team reports one.
+  # =========================================================================
+  - name: agentgate.sli.cost_anomaly
+    interval: 5m
+    rules:
+      - record: agentgate:cost_anomaly:platform_surfaced_ratio_7d
+        expr: |
+          sum by (env) (increase(agentgate_fleet_cost_anomalies_total{surfaced_by="platform"}[7d]))
+          / clamp_min(sum by (env) (increase(agentgate_fleet_cost_anomalies_total[7d])), 1)
+
+  # =========================================================================
+  # ALERTS — availability
+  # =========================================================================
+  - name: agentgate.slo.gateway_availability.alerts
+    rules:
+      - alert: GatewayAvailabilityFastBurn
+        # 13.44 x 0.001 = 0.01344 -> 2% of the 28d budget per hour.
+        expr: |
+          (
+            agentgate:gateway_availability:error_ratio_rate1h > 0.01344
+            and
+            agentgate:gateway_availability:error_ratio_rate5m > 0.01344
+          )
+        for: 2m
+        labels:
+          severity: critical
+          notify: page
+          service: gateway
+          slo: gateway_availability
+          burn_window: 1h
+        annotations:
+          summary: "Gateway availability burning 28d error budget at 13.4x in {{ $labels.env }}"
+          description: >-
+            Gateway 5xx / no_healthy_backend ratio is {{ $value | humanizePercentage }}
+            over the last hour and is still elevated over the last 5 minutes.
+            At this rate the entire 28-day error budget (40m19s of downtime) is
+            consumed in under 3 hours. Check breaker state per backend, provider
+            health, and whether a recent gateway rollout is implicated.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/gateway-availability-burn.md"
+          dashboard_url: "https://grafana.agentgate.internal/d/agentgate-gateway-golden/gateway-golden-signals"
+
+      - alert: GatewayAvailabilitySlowBurn
+        # 5.6 x 0.001 = 0.0056 -> 5% of the 28d budget per 6h.
+        expr: |
+          (
+            agentgate:gateway_availability:error_ratio_rate6h > 0.0056
+            and
+            agentgate:gateway_availability:error_ratio_rate30m > 0.0056
+          )
+        for: 15m
+        labels:
+          severity: critical
+          notify: page
+          service: gateway
+          slo: gateway_availability
+          burn_window: 6h
+        annotations:
+          summary: "Gateway availability burning 28d error budget at 5.6x in {{ $labels.env }}"
+          description: >-
+            Sustained elevated failure ratio ({{ $value | humanizePercentage }})
+            over 6 hours. This is the shape of a partial provider degradation or
+            a single unhealthy pool rather than a hard outage; identify the pool
+            and backend before failing the whole fleet over.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/gateway-availability-burn.md"
+          dashboard_url: "https://grafana.agentgate.internal/d/agentgate-gateway-golden/gateway-golden-signals"
+
+      - alert: GatewayAvailabilityBudgetBurnTicket
+        # 0.9333 x 0.001 = 0.000933 -> 10% of the 28d budget per 3 days.
+        expr: |
+          (
+            agentgate:gateway_availability:error_ratio_rate3d > 0.000933
+            and
+            agentgate:gateway_availability:error_ratio_rate6h > 0.000933
+          )
+        for: 1h
+        labels:
+          severity: warning
+          notify: ticket
+          service: gateway
+          slo: gateway_availability
+          burn_window: 3d
+        annotations:
+          summary: "Gateway error budget draining slowly in {{ $labels.env }} (10% per 3d)"
+          description: >-
+            Background failure rate of {{ $value | humanizePercentage }} is
+            consuming 10% of the 28-day budget every 3 days. Nobody is being
+            paged for this and nobody should be, but it will exhaust the budget
+            before the window rolls. Find the recurring failure class.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/gateway-availability-burn.md"
+
+      - alert: GatewayErrorBudgetExhausted
+        expr: agentgate:gateway_availability:error_budget_remaining_ratio <= 0
+        for: 10m
+        labels:
+          severity: warning
+          notify: ticket
+          service: gateway
+          slo: gateway_availability
+        annotations:
+          summary: "Gateway 28d error budget exhausted in {{ $labels.env }}"
+          description: >-
+            The 28-day availability budget is fully spent. Per the platform's
+            release policy this freezes non-essential gateway deploys in
+            {{ $labels.env }} until the budget recovers or an exception is
+            recorded.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/error-budget-policy.md"
+
+  # =========================================================================
+  # ALERTS — latency and TTFT
+  # =========================================================================
+  - name: agentgate.slo.gateway_latency.alerts
+    rules:
+      - alert: GatewayLatencyFastBurn
+        # Objective is 99% of minutes, so budget = 0.01 bad minutes.
+        # 13.44 x 0.01 = 0.1344.
+        expr: |
+          (
+            agentgate:gateway_latency:bad_ratio_rate1h > 0.1344
+            and
+            agentgate:gateway_latency:bad_ratio_rate5m > 0.1344
+          )
+        for: 5m
+        labels:
+          severity: critical
+          notify: page
+          service: gateway
+          slo: gateway_latency
+          burn_window: 1h
+        annotations:
+          summary: "Gateway overhead p95 above 60ms for {{ $value | humanizePercentage }} of the last hour in {{ $labels.env }}"
+          description: >-
+            This measures gateway overhead only — provider time is excluded — so
+            a slow model is not the cause. Look at policy-stage timings on the
+            span (agentgate.policy.<stage>.duration_ms), Redis latency for the
+            rate-limit and quota stages, and the guardrail callout.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/gateway-latency.md"
+          dashboard_url: "https://grafana.agentgate.internal/d/agentgate-gateway-golden/gateway-golden-signals"
+
+      - alert: GatewayLatencySlowBurn
+        expr: |
+          (
+            agentgate:gateway_latency:bad_ratio_rate6h > 0.056
+            and
+            agentgate:gateway_latency:bad_ratio_rate30m > 0.056
+          )
+        for: 20m
+        labels:
+          severity: critical
+          notify: page
+          service: gateway
+          slo: gateway_latency
+          burn_window: 6h
+        annotations:
+          summary: "Gateway overhead p95 sustained above 60ms in {{ $labels.env }}"
+          description: >-
+            Six-hour bad-minute ratio is {{ $value | humanizePercentage }}.
+            Typically a dependency that got slower rather than one that broke:
+            check Redis p99, the guardrail service, and control-plane
+            registry lookups.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/gateway-latency.md"
+
+      - alert: GatewayLatencyBudgetBurnTicket
+        expr: |
+          (
+            agentgate:gateway_latency:bad_ratio_rate3d > 0.00933
+            and
+            agentgate:gateway_latency:bad_ratio_rate6h > 0.00933
+          )
+        for: 1h
+        labels:
+          severity: warning
+          notify: ticket
+          service: gateway
+          slo: gateway_latency
+          burn_window: 3d
+        annotations:
+          summary: "Gateway latency budget draining slowly in {{ $labels.env }}"
+          description: >-
+            Gateway overhead exceeds the 60ms objective often enough to consume
+            10% of the latency budget every 3 days. Usually a capacity or
+            garbage-collection trend rather than an incident.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/gateway-latency.md"
+
+      - alert: GatewayTTFTFastBurn
+        expr: |
+          (
+            agentgate:gateway_ttft:bad_ratio_rate1h > 0.1344
+            and
+            agentgate:gateway_ttft:bad_ratio_rate5m > 0.1344
+          )
+        for: 5m
+        labels:
+          severity: critical
+          notify: page
+          service: gateway
+          slo: gateway_ttft
+          burn_window: 1h
+        annotations:
+          summary: "Streaming TTFT p95 above 1200ms in {{ $labels.env }}"
+          description: >-
+            Time-to-first-token is what a chat user experiences as "is it
+            broken". Check whether traffic has shifted to the priority-2
+            failover tier (agentgate_breaker_state), whether the guardrail
+            input scan is slow, and whether prompt sizes have grown.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/gateway-ttft.md"
+          dashboard_url: "https://grafana.agentgate.internal/d/agentgate-gateway-golden/gateway-golden-signals"
+
+      - alert: GatewayTTFTSlowBurn
+        expr: |
+          (
+            agentgate:gateway_ttft:bad_ratio_rate6h > 0.056
+            and
+            agentgate:gateway_ttft:bad_ratio_rate30m > 0.056
+          )
+        for: 20m
+        labels:
+          severity: warning
+          notify: ticket
+          service: gateway
+          slo: gateway_ttft
+          burn_window: 6h
+        annotations:
+          summary: "Streaming TTFT p95 degraded for 6h in {{ $labels.env }}"
+          description: >-
+            Sustained TTFT regression. If it correlates with a pool weight
+            change or a failover to the on-prem tier this is expected and the
+            pool configuration, not the code, is what needs attention.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/gateway-ttft.md"
+
+  # =========================================================================
+  # ALERTS — control plane
+  # =========================================================================
+  - name: agentgate.slo.controlplane.alerts
+    rules:
+      - alert: ControlPlaneTokenExchangeFastBurn
+        # 99.95% objective -> budget 0.0005. 13.44 x 0.0005 = 0.00672.
+        expr: |
+          (
+            agentgate:controlplane_token_exchange:error_ratio_rate1h > 0.00672
+            and
+            agentgate:controlplane_token_exchange:error_ratio_rate5m > 0.00672
+          )
+        for: 2m
+        labels:
+          severity: critical
+          notify: page
+          service: controlplane
+          slo: controlplane_token_exchange
+          burn_window: 1h
+        annotations:
+          summary: "Token exchange failing at {{ $value | humanizePercentage }} in {{ $labels.env }}"
+          description: >-
+            RFC 8693 token exchange is failing. Running agents keep working
+            until their current token expires, so this looks quiet and then
+            becomes a fleet-wide authentication outage within one token
+            lifetime. Treat as urgent even when request volume looks normal.
+            Check JWKS availability, the signing key mount, and the database.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/token-exchange-failure.md"
+
+      - alert: ControlPlaneTokenExchangeSlowBurn
+        expr: |
+          (
+            agentgate:controlplane_token_exchange:error_ratio_rate6h > 0.0028
+            and
+            agentgate:controlplane_token_exchange:error_ratio_rate30m > 0.0028
+          )
+        for: 15m
+        labels:
+          severity: critical
+          notify: page
+          service: controlplane
+          slo: controlplane_token_exchange
+          burn_window: 6h
+        annotations:
+          summary: "Token exchange error budget burning at 5.6x in {{ $labels.env }}"
+          description: >-
+            Partial token-exchange failure sustained over 6 hours. Often one
+            runtime's attestation path (AKS projected token, IRSA, SPIFFE) is
+            broken while the others are fine — group failures by `runtime`.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/token-exchange-failure.md"
+
+      - alert: ControlPlaneTokenExchangeBudgetBurnTicket
+        expr: |
+          (
+            agentgate:controlplane_token_exchange:error_ratio_rate3d > 0.000467
+            and
+            agentgate:controlplane_token_exchange:error_ratio_rate6h > 0.000467
+          )
+        for: 1h
+        labels:
+          severity: warning
+          notify: ticket
+          service: controlplane
+          slo: controlplane_token_exchange
+          burn_window: 3d
+        annotations:
+          summary: "Token exchange budget draining slowly in {{ $labels.env }}"
+          description: >-
+            A small, persistent fraction of token exchanges is failing. Most
+            often a single misconfigured agent retrying forever; find it by
+            grouping failures by agent identity before spending time on the
+            control plane itself.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/token-exchange-failure.md"
+
+      - alert: ControlPlaneTokenExchangeLatencyHigh
+        expr: agentgate:controlplane_token_exchange:p95_5m > 0.150
+        for: 10m
+        labels:
+          severity: warning
+          notify: ticket
+          service: controlplane
+          slo: controlplane_token_exchange
+        annotations:
+          summary: "Token exchange p95 {{ $value | humanizeDuration }} exceeds the 150ms objective in {{ $labels.env }}"
+          description: >-
+            Token exchange is on the cold-start path of every agent process. At
+            this latency a large scale-up event becomes visibly slow to start.
+            Check database connection pool saturation and vault round trips.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/token-exchange-failure.md"
+
+  # =========================================================================
+  # ALERTS — telemetry completeness and cost anomaly detection
+  # =========================================================================
+  - name: agentgate.slo.telemetry_and_cost.alerts
+    rules:
+      - alert: TelemetryCompletenessSLOBreached
+        expr: agentgate:telemetry_completeness:agents_below_objective_ratio > 0.01
+        for: 30m
+        labels:
+          severity: warning
+          notify: ticket
+          service: fleetview
+          slo: telemetry_completeness
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of agents below 0.98 telemetry completeness in {{ $labels.env }}"
+          description: >-
+            More than 1% of the fleet has untrustworthy telemetry. This is not
+            only an observability problem: completeness is a hard promotion
+            gate (SPEC §1.4), so these agents cannot ship to production until
+            it recovers. Check collector queue saturation and whether a
+            specific runtime or SDK version is implicated.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/telemetry-degraded.md"
+          dashboard_url: "https://grafana.agentgate.internal/d/agentgate-fleet-overview/fleet-overview"
+
+      - alert: CostAnomalyDetectionSLOBreached
+        expr: agentgate:cost_anomaly:platform_surfaced_ratio_7d < 0.95
+        for: 6h
+        labels:
+          severity: warning
+          notify: ticket
+          service: fleetview
+          slo: cost_anomaly_detection
+        annotations:
+          summary: "Only {{ $value | humanizePercentage }} of cost anomalies surfaced by the platform first in {{ $labels.env }}"
+          description: >-
+            Teams are finding their own cost anomalies before AgentGate reports
+            them, which is the failure mode this SLI exists to catch. Review
+            the EWMA sensitivity and whether new agents are being onboarded
+            without a baseline long enough to detect against.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/cost-anomaly.md"

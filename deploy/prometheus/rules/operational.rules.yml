@@ -1,0 +1,609 @@
+# AgentGate — operational alerts.
+#
+# These are threshold alerts on conditions that are actionable in themselves,
+# as opposed to the SLO burn-rate alerts in slo.rules.yml. The division matters:
+# an SLO alert says "users are being hurt, at this rate"; an operational alert
+# says "this specific mechanism is behaving in a way that will hurt users soon
+# or is hiding the fact that it already is".
+#
+# Series referenced beyond the SPEC §4.3 table:
+#   agentgate_quota_monthly_budget_used_ratio {tenant,team,agent,env}  gauge, fleetview
+#   agentgate_cost_center_daily_ceiling_usd   {env,cost_center}        gauge, fleetview
+#   agentgate_guardrail_failopen_total        {env,pool}               counter, gateway
+#   certmanager_certificate_expiration_timestamp_seconds               cert-manager
+#   probe_ssl_earliest_cert_expiry                                     blackbox exporter
+
+groups:
+
+  # =========================================================================
+  # Circuit breakers (SPEC §3.3)
+  # =========================================================================
+  - name: agentgate.operational.breaker
+    interval: 15s
+    rules:
+      - record: agentgate:breaker_open:count_by_pool
+        expr: |
+          sum by (env, pool) (agentgate_breaker_state{state="open"} == 1)
+      - record: agentgate:backends_total:count_by_pool
+        expr: |
+          count by (env, pool) (agentgate_breaker_state{state="closed"})
+          + count by (env, pool) (agentgate_breaker_state{state="open"})
+          + count by (env, pool) (agentgate_breaker_state{state="half_open"})
+
+      - alert: BackendCircuitBreakerOpen
+        expr: agentgate_breaker_state{state="open"} == 1
+        # 2m, not 0m: the breaker is designed to open for 30s and self-heal.
+        # Alerting on the first trip would page for the mechanism working.
+        for: 2m
+        labels:
+          severity: warning
+          notify: ticket
+          service: gateway
+          component: resilience
+        annotations:
+          summary: "Circuit breaker open for backend {{ $labels.backend }} in {{ $labels.env }}"
+          description: >-
+            The breaker for {{ $labels.backend }} has stayed open for more than
+            2 minutes, meaning half-open probes are still failing. Traffic is
+            being served by the remaining backends in the pool, at whatever
+            cost and latency those imply. Confirm provider status before
+            assuming an AgentGate fault.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/breaker-open.md"
+
+      - alert: PoolAllBackendsOpen
+        expr: |
+          agentgate:breaker_open:count_by_pool >= agentgate:backends_total:count_by_pool
+        for: 1m
+        labels:
+          severity: critical
+          notify: page
+          service: gateway
+          component: resilience
+        annotations:
+          summary: "Every backend in pool {{ $labels.pool }} is open-circuit in {{ $labels.env }}"
+          description: >-
+            Pool {{ $labels.pool }} has no healthy backend, so every request to
+            it is returning 503 no_healthy_backend. Both the priority-1 tier and
+            the failover tier are down or draining. This is a user-visible
+            outage for every agent entitled to this pool.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/no-healthy-backend.md"
+
+  # =========================================================================
+  # Provider degradation — the state before the breaker trips
+  # =========================================================================
+  - name: agentgate.operational.provider
+    interval: 15s
+    rules:
+      - record: agentgate:backend_error_ratio:rate5m
+        expr: |
+          sum by (env, pool, backend) (rate(agentgate_gateway_requests_total{status=~"5.."}[5m]))
+          / clamp_min(sum by (env, pool, backend) (rate(agentgate_gateway_requests_total[5m])), 1e-9)
+      - record: agentgate:backend_ttft:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (env, pool, backend, le) (rate(agentgate_gateway_ttft_seconds_bucket[5m]))
+          )
+
+      - alert: ProviderDegraded
+        expr: |
+          (
+            agentgate:backend_error_ratio:rate5m > 0.05
+            and
+            sum by (env, pool, backend) (rate(agentgate_gateway_requests_total[5m])) > 0.2
+          )
+        # The volume guard above (>0.2 rps ~ 60 requests in 5m) stops a backend
+        # that saw three requests, two of which failed, from paging anyone.
+        for: 10m
+        labels:
+          severity: warning
+          notify: ticket
+          service: gateway
+          component: provider
+        annotations:
+          summary: "Backend {{ $labels.backend }} error ratio {{ $value | humanizePercentage }} in {{ $labels.env }}"
+          description: >-
+            {{ $labels.backend }} is failing more than 5% of requests but has
+            not yet tripped its breaker (50% failure rate or 10 consecutive
+            failures). Retries and failover are absorbing this, which means
+            cost and latency are rising while availability still looks fine.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/provider-degradation.md"
+
+      - alert: ProviderLatencyDegraded
+        expr: |
+          (
+            agentgate:backend_ttft:p95_5m
+            > 2 * avg_over_time(agentgate:backend_ttft:p95_5m[6h] offset 1d)
+            and
+            agentgate:backend_ttft:p95_5m > 2
+          )
+        for: 15m
+        labels:
+          severity: warning
+          notify: ticket
+          service: gateway
+          component: provider
+        annotations:
+          summary: "Backend {{ $labels.backend }} TTFT p95 is double its usual value in {{ $labels.env }}"
+          description: >-
+            Compared against the same period yesterday, {{ $labels.backend }}
+            is taking more than twice as long to first token, and more than 2s
+            absolute. Consider shifting pool weight away from it before the
+            gateway TTFT SLO starts burning.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/provider-degradation.md"
+
+      - alert: FailoverTierCarryingTraffic
+        expr: |
+          (
+            sum by (env, pool) (rate(agentgate_gateway_requests_total{backend=~".*onprem.*"}[10m]))
+            / clamp_min(sum by (env, pool) (rate(agentgate_gateway_requests_total[10m])), 1e-9)
+          ) > 0.25
+        for: 15m
+        labels:
+          severity: warning
+          notify: ticket
+          service: gateway
+          component: routing
+        annotations:
+          summary: "Failover tier serving {{ $value | humanizePercentage }} of pool {{ $labels.pool }} in {{ $labels.env }}"
+          description: >-
+            The priority-2 on-prem tier exists as a safety net, not as capacity.
+            Sustained traffic there means the priority-1 backends are unhealthy
+            or capacity-capped, and the on-prem tier's much lower concurrency
+            cap will start shedding load if this grows.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/provider-degradation.md"
+
+  # =========================================================================
+  # Retry storms (SPEC §3.3 — fleet retry budget is 10% of request volume)
+  # =========================================================================
+  - name: agentgate.operational.retries
+    interval: 15s
+    rules:
+      - record: agentgate:retry_ratio:rate5m
+        expr: |
+          sum by (env) (rate(agentgate_retry_attempts_total[5m]))
+          / clamp_min(sum by (env) (rate(agentgate_gateway_requests_total[5m])), 1e-9)
+      - record: agentgate:retry_ratio:rate5m_by_backend
+        expr: |
+          sum by (env, backend) (rate(agentgate_retry_attempts_total[5m]))
+          / clamp_min(sum by (env, backend) (rate(agentgate_gateway_requests_total[5m])), 1e-9)
+
+      - alert: RetryStorm
+        expr: agentgate:retry_ratio:rate5m > 0.10
+        for: 5m
+        labels:
+          severity: critical
+          notify: page
+          service: gateway
+          component: resilience
+        annotations:
+          summary: "Fleet retry ratio {{ $value | humanizePercentage }} exceeds the 10% budget in {{ $labels.env }}"
+          description: >-
+            Retries are amplifying load beyond the fleet-wide 10% budget. This
+            is the mechanism by which a recoverable provider brownout becomes a
+            self-sustaining outage: every retry adds load to the thing that is
+            already failing. Verify the retry budget limiter is actually
+            engaged; if it is, the budget is being consumed legitimately and the
+            underlying backend is the problem.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/retry-storm.md"
+
+      - alert: RetryBudgetNearExhaustion
+        expr: agentgate:retry_ratio:rate5m > 0.075
+        for: 10m
+        labels:
+          severity: warning
+          notify: ticket
+          service: gateway
+          component: resilience
+        annotations:
+          summary: "Fleet retry ratio {{ $value | humanizePercentage }} approaching the 10% budget in {{ $labels.env }}"
+          description: >-
+            Retry volume is at three quarters of the fleet budget. Once the
+            budget is exhausted, retryable failures stop being retried and
+            surface to callers as errors, so availability will degrade
+            step-wise rather than gradually.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/retry-storm.md"
+
+  # =========================================================================
+  # Quota and rate-limit saturation (SPEC §3.4)
+  # =========================================================================
+  - name: agentgate.operational.quota
+    interval: 30s
+    rules:
+      - record: agentgate:ratelimit_denied_ratio:rate5m_by_agent
+        expr: |
+          sum by (env, agent) (rate(agentgate_ratelimit_decisions_total{decision=~"limit|quota"}[5m]))
+          / clamp_min(sum by (env, agent) (rate(agentgate_ratelimit_decisions_total[5m])), 1e-9)
+
+      - alert: AgentQuotaSaturated
+        expr: |
+          (
+            agentgate:ratelimit_denied_ratio:rate5m_by_agent > 0.20
+            and
+            sum by (env, agent) (rate(agentgate_ratelimit_decisions_total[5m])) > 0.1
+          )
+        for: 10m
+        labels:
+          severity: warning
+          notify: ticket
+          service: gateway
+          component: quota
+        annotations:
+          summary: "Agent {{ $labels.agent }} is being throttled on {{ $value | humanizePercentage }} of requests in {{ $labels.env }}"
+          description: >-
+            The agent is hitting its RPM or TPM ceiling. Either its declared
+            quota no longer matches its real traffic — in which case the owning
+            team should request a quota change through the registry — or it is
+            in a retry loop of its own making. Do not raise the quota without
+            checking which.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/quota-saturation.md"
+
+      - alert: AgentMonthlyBudgetNearExhaustion
+        expr: agentgate_quota_monthly_budget_used_ratio > 0.85
+        for: 30m
+        labels:
+          severity: warning
+          notify: ticket
+          service: fleetview
+          component: quota
+        annotations:
+          summary: "Agent {{ $labels.agent }} has used {{ $value | humanizePercentage }} of its monthly token budget"
+          description: >-
+            At exhaustion the gateway returns 429 quota_exceeded for the rest of
+            the month, which for a production agent is an outage with a
+            date attached. Raise the budget or throttle the workload now, while
+            it is still a planning decision.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/quota-saturation.md"
+
+      - alert: GatewayLoadShedding
+        expr: |
+          sum by (env) (rate(agentgate_ratelimit_decisions_total{decision="shed"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          notify: ticket
+          service: gateway
+          component: capacity
+        annotations:
+          summary: "Gateway is shedding batch-priority load in {{ $labels.env }}"
+          description: >-
+            Concurrency has exceeded the configured ceiling and batch-priority
+            requests are being rejected with 429 to protect interactive
+            traffic. The protection is working; the capacity is not sufficient.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/load-shedding.md"
+
+  # =========================================================================
+  # Cost anomaly (SPEC §5 — EWMA + 3 sigma per agent per hour, plus a hard
+  # daily ceiling per cost centre)
+  # =========================================================================
+  - name: agentgate.operational.cost
+    interval: 1m
+    rules:
+      # USD per hour, per agent. rate() x 3600 rather than increase() so the
+      # series is smooth enough to compare against a baseline.
+      - record: agentgate:cost_usd_per_hour:by_agent
+        expr: |
+          sum by (env, tenant, team, agent, cost_center) (
+            rate(agentgate_gateway_cost_usd_total[1h])
+          ) * 3600
+
+      # fleetview computes the real EWMA described in SPEC §5; Prometheus has
+      # no EWMA function, so the paging rule uses a 7-day rolling mean and
+      # standard deviation of the same series. It is a close enough
+      # approximation for a 3-sigma threshold and it keeps the alert
+      # evaluable without a round trip to fleetview.
+      - record: agentgate:cost_usd_per_hour:baseline_7d
+        expr: avg_over_time(agentgate:cost_usd_per_hour:by_agent[7d])
+      - record: agentgate:cost_usd_per_hour:stddev_7d
+        expr: stddev_over_time(agentgate:cost_usd_per_hour:by_agent[7d])
+
+      - record: agentgate:cost_usd:daily_by_cost_center
+        expr: |
+          sum by (env, cost_center) (increase(agentgate_gateway_cost_usd_total[24h]))
+
+      - alert: AgentCostAnomaly
+        expr: |
+          (
+            agentgate:cost_usd_per_hour:by_agent
+            > agentgate:cost_usd_per_hour:baseline_7d + 3 * agentgate:cost_usd_per_hour:stddev_7d
+          )
+          and
+          (
+            agentgate:cost_usd_per_hour:by_agent > 5
+          )
+        # The absolute floor of $5/h stops a agent that normally spends $0.02/h
+        # from paging when it spends $0.30/h — statistically dramatic, fiscally
+        # irrelevant.
+        for: 15m
+        labels:
+          severity: warning
+          notify: ticket
+          service: fleetview
+          component: cost
+        annotations:
+          summary: "Agent {{ $labels.agent }} spend is 3 sigma above baseline ({{ $value | printf \"%.2f\" }} USD/h) in {{ $labels.env }}"
+          description: >-
+            Hourly spend for {{ $labels.agent }} (cost centre
+            {{ $labels.cost_center }}) is more than three standard deviations
+            above its 7-day mean. Common causes, in order of frequency: a
+            prompt-size regression, a retry loop, an agent looping on a tool
+            call, and a legitimate traffic increase nobody told the platform
+            about.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/cost-anomaly.md"
+          dashboard_url: "https://grafana.agentgate.internal/d/agentgate-cost-chargeback/cost-and-chargeback"
+
+      - alert: CostCenterDailyCeilingBreached
+        expr: |
+          agentgate:cost_usd:daily_by_cost_center
+          > on (env, cost_center) group_left agentgate_cost_center_daily_ceiling_usd
+        for: 10m
+        labels:
+          severity: critical
+          notify: page
+          service: fleetview
+          component: cost
+        annotations:
+          summary: "Cost centre {{ $labels.cost_center }} exceeded its daily ceiling in {{ $labels.env }}"
+          description: >-
+            Rolling 24-hour spend for {{ $labels.cost_center }} is above the
+            hard ceiling recorded in the registry. This is the backstop for the
+            statistical detector: it fires regardless of how gradually the
+            spend grew. Escalate to the owning team's on-call and consider
+            applying a temporary quota reduction.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/cost-anomaly.md"
+
+      - alert: UnattributedSpendRising
+        expr: |
+          (
+            sum by (env) (rate(agentgate_gateway_cost_usd_total{cost_center="UNATTRIBUTED"}[1h]))
+            / clamp_min(sum by (env) (rate(agentgate_gateway_cost_usd_total[1h])), 1e-9)
+          ) > 0.01
+        for: 1h
+        labels:
+          severity: warning
+          notify: ticket
+          service: fleetview
+          component: cost
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of spend is unattributed in {{ $labels.env }}"
+          description: >-
+            Spend is landing in the UNATTRIBUTED bucket, which means requests
+            are reaching the gateway with tokens that carry no cost centre.
+            In prod that should be impossible (SPEC §1.2), so this is either a
+            token-issuance bug or traffic arriving on a path that skips
+            verification. Chargeback cannot be closed for the month until this
+            is zero.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/cost-attribution.md"
+
+  # =========================================================================
+  # Telemetry completeness / pipeline health (SPEC §4.5)
+  # =========================================================================
+  - name: agentgate.operational.telemetry
+    interval: 30s
+    rules:
+      - alert: TelemetryDegradedForAgent
+        expr: agentgate_telemetry_completeness < 0.95
+        for: 15m
+        labels:
+          severity: warning
+          notify: ticket
+          service: fleetview
+          component: telemetry
+        annotations:
+          summary: "Telemetry completeness {{ $value | humanizePercentage }} for agent {{ $labels.agent }} in {{ $labels.env }}"
+          description: >-
+            Fewer than 95% of this agent's gateway requests produced a complete,
+            correctly attributed trace. The agent cannot be promoted to
+            production while this holds (SPEC §1.4), and any investigation into
+            its behaviour is working from partial data. Check the agent's SDK
+            version, its OTLP endpoint configuration, and collector queue
+            saturation on the nodes it runs on.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/telemetry-degraded.md"
+
+      - alert: TelemetryCollectorDroppingData
+        expr: |
+          sum by (job, tier) (rate(otelcol_processor_refused_spans_total[5m]))
+          + sum by (job, tier) (rate(otelcol_exporter_send_failed_spans_total[5m]))
+          > 0
+        for: 10m
+        labels:
+          severity: critical
+          notify: page
+          service: otel-collector
+          component: telemetry
+        annotations:
+          summary: "OTel collector ({{ $labels.tier }} tier) is dropping spans"
+          description: >-
+            The collector is refusing or failing to export spans. Every
+            downstream number — SLIs, chargeback, promotion gates — is now
+            being computed from incomplete data, and it will not look
+            incomplete: it will look like the fleet got quieter. Treat data
+            loss in the telemetry plane as an incident in its own right.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/telemetry-degraded.md"
+
+      - alert: TelemetryTailSamplingEvictingTraces
+        expr: |
+          rate(otelcol_processor_tail_sampling_sampling_trace_dropped_too_early[10m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          notify: ticket
+          service: otel-collector
+          component: telemetry
+        annotations:
+          summary: "Tail sampling is evicting traces before a decision is made"
+          description: >-
+            Traces are being dropped before the sampling decision, so the
+            "keep 100% of errors" guarantee no longer holds. Either
+            decision_wait is shorter than the p99 trace duration or num_traces
+            is too small for current volume. See deploy/otel/README.md.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/telemetry-degraded.md"
+
+      - alert: AttributionCorrectionsRising
+        expr: |
+          (
+            sum by (env) (rate(agentgate_gateway_requests_total{attribution_corrected="true"}[30m]))
+            / clamp_min(sum by (env) (rate(agentgate_gateway_requests_total[30m])), 1e-9)
+          ) > 0.05
+        for: 30m
+        labels:
+          severity: warning
+          notify: ticket
+          service: gateway
+          component: telemetry
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of requests needed ownership correction in {{ $labels.env }}"
+          description: >-
+            Agents are declaring ownership attributes that disagree with their
+            verified token. The gateway is correcting them, so chargeback is
+            still right, but the agents' own dashboards and logs are wrong.
+            Usually a stale pod annotation after a team or cost-centre change.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/cost-attribution.md"
+
+  # =========================================================================
+  # Guardrails (SPEC §3.6)
+  # =========================================================================
+  - name: agentgate.operational.guardrails
+    interval: 30s
+    rules:
+      - alert: GuardrailFailingOpen
+        expr: |
+          sum by (env, pool) (rate(agentgate_guardrail_failopen_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          notify: page
+          service: guardrails
+          component: safety
+        annotations:
+          summary: "Guardrail checks are failing open for pool {{ $labels.pool }} in {{ $labels.env }}"
+          description: >-
+            The content-safety service is unreachable or timing out and the
+            pool's policy is fail_open, so requests are being served WITHOUT a
+            safety check. This is a deliberate availability trade-off, but it
+            is also an unreviewed data path: every minute it continues is a
+            minute of unscanned traffic that has to be accounted for.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/guardrail-unavailable.md"
+
+      - alert: GuardrailBlockRateSpike
+        expr: |
+          (
+            sum by (env, pool, category) (rate(agentgate_guardrail_decisions_total{action="block"}[15m]))
+            / clamp_min(sum by (env, pool, category) (rate(agentgate_guardrail_decisions_total[15m])), 1e-9)
+          ) > 0.10
+        for: 15m
+        labels:
+          severity: warning
+          notify: ticket
+          service: guardrails
+          component: safety
+        annotations:
+          summary: "Guardrail blocking {{ $value | humanizePercentage }} of {{ $labels.category }} in pool {{ $labels.pool }}"
+          description: >-
+            A block rate this high is nearly always a policy or prompt-template
+            change rather than a genuine surge of unsafe content. Verify before
+            an agent team spends a day debugging 403 guardrail_blocked.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/guardrail-unavailable.md"
+
+  # =========================================================================
+  # Certificates (SPEC §8 — 90-day rotation, expiry alert at 21 days)
+  # =========================================================================
+  - name: agentgate.operational.certificates
+    interval: 5m
+    rules:
+      # cert-manager-issued certificates (in-cluster: gateway, control plane,
+      # collector mTLS).
+      - alert: CertificateExpiringSoon
+        expr: |
+          (certmanager_certificate_expiration_timestamp_seconds - time()) < (21 * 24 * 3600)
+        for: 1h
+        labels:
+          severity: warning
+          notify: ticket
+          component: pki
+        annotations:
+          summary: "Certificate {{ $labels.name }} expires in {{ $value | humanizeDuration }}"
+          description: >-
+            ACME renewal normally happens at two thirds of a 90-day lifetime, so
+            reaching 21 days means renewal has already failed at least once.
+            Check the issuer, the DNS-01/HTTP-01 solver, and whether the
+            enterprise PKI intermediate itself is still valid.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/certificate-expiry.md"
+
+      - alert: CertificateExpiringCritical
+        expr: |
+          (certmanager_certificate_expiration_timestamp_seconds - time()) < (7 * 24 * 3600)
+        for: 15m
+        labels:
+          severity: critical
+          notify: page
+          component: pki
+        annotations:
+          summary: "Certificate {{ $labels.name }} expires in under 7 days"
+          description: >-
+            Automated renewal has not recovered. At expiry, every mTLS path in
+            SPEC §8 that depends on this certificate fails closed
+            simultaneously — agents to gateway, gateway to egress proxy,
+            collector to backend. Renew manually now.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/certificate-expiry.md"
+
+      # Externally probed endpoints (private DNS names behind the internal load
+      # balancer) — catches certificates that are valid in the cluster but not
+      # what a caller actually receives.
+      - alert: ServingCertificateExpiringSoon
+        expr: (probe_ssl_earliest_cert_expiry - time()) < (21 * 24 * 3600)
+        for: 1h
+        labels:
+          severity: warning
+          notify: ticket
+          component: pki
+        annotations:
+          summary: "Served certificate for {{ $labels.instance }} expires in {{ $value | humanizeDuration }}"
+          description: >-
+            The certificate presented on the wire at {{ $labels.instance }} is
+            within 21 days of expiry. Note this can differ from the
+            cert-manager view if a load balancer or API Management instance is
+            serving an older certificate than the one the cluster has renewed.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/certificate-expiry.md"
+
+  # =========================================================================
+  # Liveness of the monitoring itself
+  # =========================================================================
+  - name: agentgate.operational.meta
+    interval: 30s
+    rules:
+      - alert: AgentGateTargetDown
+        expr: up{job=~"agentgate-.*"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          notify: page
+          component: monitoring
+        annotations:
+          summary: "Scrape target {{ $labels.job }} ({{ $labels.instance }}) is down"
+          description: >-
+            Prometheus cannot scrape this target. Until it returns, every SLO
+            rule that depends on it evaluates on stale or absent data and the
+            burn-rate alerts will not fire no matter what the service is doing.
+            Absence of alerts is not evidence of health.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/monitoring-down.md"
+
+      - alert: GatewayMetricsStale
+        expr: |
+          absent(agentgate_gateway_requests_total)
+          or
+          (time() - max(timestamp(agentgate_gateway_requests_total))) > 300
+        for: 5m
+        labels:
+          severity: critical
+          notify: page
+          service: gateway
+          component: monitoring
+        annotations:
+          summary: "No gateway request metrics for 5 minutes"
+          description: >-
+            The gateway's request counter has stopped advancing or disappeared
+            entirely. Either the gateway is not serving, or its metrics
+            endpoint has become unreachable to Prometheus — both look identical
+            from here and both need a human immediately.
+          runbook_url: "https://github.com/agentgate/agentgate/blob/main/docs/runbooks/monitoring-down.md"

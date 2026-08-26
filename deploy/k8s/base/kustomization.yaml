@@ -1,0 +1,69 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Base manifests. Not deployable on their own by policy: the base is shaped
+# like production (content capture off, guardrails fail_closed where the pool
+# says so, 5% tail sampling) but the overlays are what set the environment
+# name, and an unlabelled environment is an unattributable one.
+
+namespace: agentgate
+
+resources:
+  - namespace.yaml
+  - serviceaccounts.yaml
+  - configmap-gateway.yaml
+  - externalsecrets.yaml
+  - gateway.yaml
+  - controlplane.yaml
+  - fleetview.yaml
+  - otel-collector-daemonset.yaml
+  - otel-collector-deployment.yaml
+  - networkpolicy.yaml
+  - httproute.yaml
+  # ingress-alternative.yaml is deliberately NOT listed — see its header.
+
+commonLabels:
+  app.kubernetes.io/part-of: agentgate
+  app.kubernetes.io/managed-by: kustomize
+
+# The collector configurations are generated from the single source of truth in
+# deploy/otel/ rather than being duplicated here. Keeping one copy is what
+# stops the cluster's pipeline and the locally-testable pipeline from drifting
+# apart.
+#
+# Reading files from outside this directory needs
+# `--load-restrictor=LoadRestrictionsNone`, which the Makefile's k8s-* targets
+# pass. The alternative — a second copy of a 300-line collector config — is a
+# worse trade.
+configMapGenerator:
+  - name: otel-collector-agent
+    files:
+      - collector-agent.yaml=../../otel/collector-agent.yaml
+    options:
+      labels:
+        app.kubernetes.io/name: otel-collector
+        app.kubernetes.io/component: telemetry-agent
+  - name: otel-collector-gateway
+    files:
+      - collector-gateway.yaml=../../otel/collector-gateway.yaml
+    options:
+      labels:
+        app.kubernetes.io/name: otel-collector
+        app.kubernetes.io/component: telemetry-gateway
+
+# Hash suffixes on the generated ConfigMaps mean editing a collector config
+# produces a new ConfigMap name, which rolls the DaemonSet and the Deployment
+# automatically. Without this, a config change would sit unapplied until
+# something else happened to restart the pods.
+generatorOptions:
+  disableNameSuffixHash: false
+
+images:
+  - name: ghcr.io/agentgate/gateway
+    newTag: 1.0.0
+  - name: ghcr.io/agentgate/controlplane
+    newTag: 1.0.0
+  - name: ghcr.io/agentgate/fleetview
+    newTag: 1.0.0
+  - name: ghcr.io/agentgate/guardrails
+    newTag: 1.0.0

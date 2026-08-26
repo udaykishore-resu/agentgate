@@ -1,0 +1,145 @@
+# Copy to terraform.tfvars (git-ignored) or, better, keep one file per
+# environment outside the repo and pass it explicitly:
+#
+#   terraform plan -var-file=../../../../env/prod.azure.tfvars
+#
+# Values below are the production shape. dev and staging differ only in the
+# marked lines.
+
+subscription_id = "00000000-0000-0000-0000-000000000000"
+tenant_id       = "11111111-1111-1111-1111-111111111111"
+
+environment = "prod" # dev | staging | prod
+location    = "westeurope"
+name_prefix = "agentgate"
+
+tags = {
+  application = "agentgate"
+  owner       = "platform-ai@client.example"
+  cost_center = "CC-0001"
+  managed_by  = "terraform"
+  # Drives the client's backup and DR tooling; not read by this configuration.
+  data_classification = "confidential"
+}
+
+# ---------------------------------------------------------------------------
+# Network — must stay in step with deploy/k8s/base/networkpolicy.yaml
+# ---------------------------------------------------------------------------
+
+vnet_cidr = "10.60.0.0/16"
+
+subnet_cidrs = {
+  aks               = "10.60.0.0/20"
+  private_endpoints = "10.60.16.0/24"
+  apim              = "10.60.17.0/24"
+  firewall          = "10.60.18.0/26"
+  firewall_mgmt     = "10.60.18.64/26"
+  postgres          = "10.60.20.0/24"
+}
+
+onprem_inference_cidr = "10.10.20.0/24"
+
+# Every addition here is a third-party risk review. Keep the list short and
+# keep the reason in the review, not in a comment nobody reads.
+egress_allowed_fqdns = [
+  "mcr.microsoft.com",
+  "*.data.mcr.microsoft.com",
+  "ghcr.io",
+  "*.pkg.github.com",
+  "login.microsoftonline.com",
+  "*.identity.azure.net",
+  "management.azure.com",
+  "packages.microsoft.com",
+  "acs-mirror.azureedge.net",
+  "client.service-now.com",
+]
+
+# ---------------------------------------------------------------------------
+# Compute
+# ---------------------------------------------------------------------------
+
+kubernetes_version = "1.31"
+
+system_node_pool = {
+  vm_size    = "Standard_D4ds_v5"
+  node_count = 3
+  zones      = ["1", "2", "3"]
+}
+
+workload_node_pool = {
+  vm_size   = "Standard_E4ds_v5"
+  min_count = 3  # dev: 1, staging: 2
+  max_count = 30 # dev: 4, staging: 10
+  zones     = ["1", "2", "3"]
+}
+
+# ---------------------------------------------------------------------------
+# State stores
+# ---------------------------------------------------------------------------
+
+postgres = {
+  sku_name              = "GP_Standard_D4ds_v5" # dev: B_Standard_B2s
+  storage_mb            = 262144
+  version               = "16"
+  backup_retention_days = 35   # dev: 7
+  geo_redundant_backup  = true # dev/staging: false
+  high_availability     = true # dev/staging: false
+}
+
+redis = {
+  # Premium is mandatory, not a sizing choice: only Premium supports private
+  # endpoints, and the rate-limit buckets must not be publicly reachable.
+  sku_name = "Premium"
+  family   = "P"
+  capacity = 1
+}
+
+# ---------------------------------------------------------------------------
+# Models — capacity is in thousands of tokens per minute
+# ---------------------------------------------------------------------------
+
+openai_deployments = [
+  {
+    name          = "gpt-4o-mini"
+    model_name    = "gpt-4o-mini"
+    model_version = "2024-07-18"
+    sku_name      = "DataZoneStandard"
+    capacity      = 300
+  },
+  {
+    name          = "gpt-4o"
+    model_name    = "gpt-4o"
+    model_version = "2024-11-20"
+    sku_name      = "DataZoneStandard"
+    capacity      = 100
+  },
+  {
+    name          = "text-embedding-3-large"
+    model_name    = "text-embedding-3-large"
+    model_version = "1"
+    sku_name      = "Standard"
+    capacity      = 120
+  },
+]
+
+# ---------------------------------------------------------------------------
+# Edge
+# ---------------------------------------------------------------------------
+
+apim_sku = "Premium_1" # dev: Developer_1 (no SLA, single unit)
+
+apim_publisher = {
+  name  = "Client Platform AI"
+  email = "platform-ai@client.example"
+}
+
+# Coarse outer guard only. The real per-agent quota is enforced by the gateway
+# (SPEC §3.4) and configured in the registry, not here.
+apim_token_limit_per_minute = 500000
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+
+log_retention_days      = 90 # dev: 30
+usage_stream_partitions = 8  # dev/staging: 2 — cannot be reduced later

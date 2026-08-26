@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector-gateway
+  namespace: agentgate
+spec:
+  template:
+    spec:
+      containers:
+        - name: collector
+          env:
+            # SPEC §4.4 baseline. Errors, guardrail blocks, failovers and
+            # anything slower than the p99 threshold are still kept at 100% by
+            # the tail_sampling policy set — this number only governs the
+            # boring traffic.
+            - name: TAIL_SAMPLING_BASELINE_PERCENT
+              value: "5"
+            - name: TRACES_OTLP_ENDPOINT
+              value: "langfuse-otlp.observability.svc.cluster.local:4317"
+            # Production content path. Distinct namespace, distinct backend,
+            # distinct access list, reviewed under data residency. With capture
+            # off in prod this pipeline normally carries nothing — it exists so
+            # that an approved, time-boxed exception has somewhere to land that
+            # is already reviewed.
+            - name: CONTENT_OTLP_ENDPOINT
+              value: "content-store-otlp.observability-restricted.svc.cluster.local:4317"
+            # Tracks the raised memory limit below; the collector's
+            # memory_limiter percentages are relative to the cgroup, but the Go
+            # GC needs telling separately.
+            - name: GOMEMLIMIT
+              value: "6800MiB"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              memory: 8Gi

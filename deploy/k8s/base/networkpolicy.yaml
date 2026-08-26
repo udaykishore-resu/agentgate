@@ -1,0 +1,555 @@
+# NetworkPolicies implementing the paths in SPEC §8.
+#
+# Model: default-deny for both directions in the whole namespace, then one
+# explicit allow per reviewed path. Every rule below corresponds to a row in
+# the SPEC §8 table, and anything not in that table cannot happen — including
+# the paths people assume exist, like "the gateway can obviously reach the
+# internet".
+#
+# Address plan (matches deploy/terraform/azure; the AWS overlay patches the
+# CIDRs to the VPC plan in deploy/terraform/aws):
+#
+#   10.60.0.0/16     VNet
+#   10.60.0.0/20     AKS node subnet
+#   10.60.16.0/24    Private Endpoints (Postgres, Redis, Key Vault, Azure OpenAI)
+#   10.60.17.0/24    API Management
+#   10.60.18.0/26    Azure Firewall (egress inspection + FQDN allowlist)
+#   10.244.0.0/16    Pod CIDR
+#   10.0.0.0/16      Service CIDR (kube-dns at 10.0.0.10)
+#   10.10.20.0/24    On-prem inference, reached over ExpressRoute
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/part-of: agentgate
+spec:
+  # Empty podSelector = every pod in the namespace. Both policy types are
+  # listed with no rules, which denies all ingress and all egress. Everything
+  # that follows is additive.
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# DNS is required by every policy that names a hostname, so it is granted
+# namespace-wide rather than repeated in each rule below.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Telemetry egress to the node-local collector. The collector is reached on the
+# node IP via hostPort, so this is an ipBlock rule against the node subnet and
+# not a podSelector.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-telemetry-egress-to-node-collector
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.60.0.0/20
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+---
+# ---------------------------------------------------------------------------
+# Gateway (SPEC §8 rows 1–4)
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  policyTypes: [Ingress]
+  ingress:
+    # Agent -> Gateway. Agents reach the gateway through the internal load
+    # balancer / Gateway API listener; the data path arrives from the gateway
+    # controller's namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gateway-system
+      ports:
+        - protocol: TCP
+          port: 8080
+    # In-cluster agents may also call the Service directly, but only from
+    # namespaces explicitly labelled as agent workloads. Labelling a namespace
+    # is the reviewable act that grants access.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              agentgate.io/agent-workload: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+    # API Management / front door, which terminates the external contract and
+    # applies the AI policy set before traffic ever reaches the gateway.
+    - from:
+        - ipBlock:
+            cidr: 10.60.17.0/24
+      ports:
+        - protocol: TCP
+          port: 8080
+    # /metrics is network-restricted per SPEC §2.1: only Prometheus, and only
+    # on 9090. Note the deliberate absence of 8080 here — a scraper has no
+    # business on the API port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  policyTypes: [Egress]
+  egress:
+    # Gateway -> control plane (authz, registry, promotion state).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: controlplane
+      ports:
+        - protocol: TCP
+          port: 8081
+    # Gateway -> guardrails.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: guardrails
+      ports:
+        - protocol: TCP
+          port: 8083
+    # Gateway -> cloud model provider over Private Endpoint (SPEC §8 row 2).
+    # No public egress: the provider is reachable only through the private
+    # endpoint subnet, so a DNS hijack or an SDK default cannot send a prompt
+    # to a public API endpoint.
+    - to:
+        - ipBlock:
+            cidr: 10.60.16.0/24
+      ports:
+        - protocol: TCP
+          port: 443
+    # Gateway -> Redis (rate-limit buckets, cache), also a Private Endpoint,
+    # TLS port only.
+    - to:
+        - ipBlock:
+            cidr: 10.60.16.0/24
+      ports:
+        - protocol: TCP
+          port: 6380
+    # Gateway -> on-prem inference over ExpressRoute (SPEC §8 row 3).
+    - to:
+        - ipBlock:
+            cidr: 10.10.20.0/24
+      ports:
+        - protocol: TCP
+          port: 443
+    # Gateway -> third-party model provider, but only via the inspecting egress
+    # proxy (SPEC §8 row 4). The FQDN allowlist and DLP inspection live in the
+    # firewall; this rule is what makes bypassing it impossible.
+    - to:
+        - ipBlock:
+            cidr: 10.60.18.0/26
+      ports:
+        - protocol: TCP
+          port: 3128
+---
+# ---------------------------------------------------------------------------
+# Control plane (SPEC §8 rows 1 and 5)
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: controlplane-ingress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: controlplane
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: fleetview
+      ports:
+        - protocol: TCP
+          port: 8081
+    # Agents perform RFC 8693 token exchange directly against the control
+    # plane, so labelled agent namespaces and the ingress path both need in.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              agentgate.io/agent-workload: "true"
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gateway-system
+      ports:
+        - protocol: TCP
+          port: 8081
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9091
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: controlplane-egress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: controlplane
+  policyTypes: [Egress]
+  egress:
+    # PostgreSQL and Key Vault, both Private Endpoints (SPEC §8 row 5).
+    - to:
+        - ipBlock:
+            cidr: 10.60.16.0/24
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 443
+    # ServiceNow change records for the promotion gate — third party, so it
+    # goes through the inspecting proxy like every other external call.
+    - to:
+        - ipBlock:
+            cidr: 10.60.18.0/26
+      ports:
+        - protocol: TCP
+          port: 3128
+---
+# ---------------------------------------------------------------------------
+# fleetview and guardrails
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fleetview-ingress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: fleetview
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: fleetview
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gateway-system
+      ports:
+        - protocol: TCP
+          port: 8082
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9092
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fleetview-egress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: fleetview
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: fleetview
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.60.16.0/24
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: controlplane
+      ports:
+        - protocol: TCP
+          port: 8081
+    # Reads the SLI recording rules to compute error budgets and the telemetry
+    # trust metrics.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: guardrails-ingress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: guardrails
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: guardrails
+  policyTypes: [Ingress]
+  ingress:
+    # Only the gateway. Nothing else may submit content for scanning, because
+    # anything else doing so would be an unreviewed path for regulated data.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+      ports:
+        - protocol: TCP
+          port: 8083
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8083
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: guardrails-egress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: guardrails
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: guardrails
+  policyTypes: [Egress]
+  egress:
+    # Managed content-safety service over Private Endpoint when running in
+    # `callout` mode.
+    - to:
+        - ipBlock:
+            cidr: 10.60.16.0/24
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# ---------------------------------------------------------------------------
+# Telemetry pipeline (SPEC §8 row 6)
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-agent-ingress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: telemetry-agent
+  policyTypes: [Ingress]
+  ingress:
+    # Anything in this namespace, plus labelled agent namespaces. Telemetry
+    # ingestion is deliberately permissive on the receive side: a workload that
+    # cannot report is invisible, and invisible is worse than noisy.
+    - from:
+        - podSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              agentgate.io/agent-workload: "true"
+        - ipBlock:
+            cidr: 10.244.0.0/16
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8888
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-agent-egress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: telemetry-agent
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: telemetry-gateway
+      ports:
+        - protocol: TCP
+          port: 4317
+    # Kubernetes API server, for the k8sattributes processor. Reached on the
+    # Service CIDR's kubernetes.default address.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.1/32
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-gateway-ingress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: telemetry-gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: telemetry-agent
+      ports:
+        - protocol: TCP
+          port: 4317
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8888
+        - protocol: TCP
+          port: 8889
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-gateway-egress
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/part-of: agentgate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: telemetry-gateway
+  policyTypes: [Egress]
+  egress:
+    # General telemetry backends: traces and logs.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 3100
+    # The content pipeline's own destination, in a separate namespace with a
+    # separate access grant. Splitting the namespace is what makes "who can
+    # read prompts" answerable with a RoleBinding list.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-restricted
+      ports:
+        - protocol: TCP
+          port: 4317
+    # Managed backend (Azure Monitor / X-Ray) over Private Endpoint, and the
+    # egress proxy for anything that has no private path (SPEC §8 row 6).
+    - to:
+        - ipBlock:
+            cidr: 10.60.16.0/24
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - ipBlock:
+            cidr: 10.60.18.0/26
+      ports:
+        - protocol: TCP
+          port: 3128

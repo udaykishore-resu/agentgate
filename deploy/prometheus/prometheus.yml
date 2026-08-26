@@ -1,0 +1,159 @@
+# AgentGate — Prometheus scrape configuration.
+#
+# This file drives the local stack (docker compose) and is the reference for
+# what must be scraped in every environment. In Kubernetes the same targets are
+# expressed as ServiceMonitors/PodMonitors against the Prometheus Operator, or
+# as Azure Managed Prometheus / AMP scrape configs; the job names and the
+# `service` label are kept identical so the recording rules, alert rules and
+# Grafana dashboards in this directory work unchanged in all of them.
+
+global:
+  # 15s matches the collector's metric export interval. Scraping faster only
+  # resamples the same values; scraping slower makes the 5m burn-rate window
+  # too coarse for the fast-burn page.
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: local
+    env: dev
+    # Set per region in the cloud overlays; the alert routing in
+    # alertmanager.yml groups on it so a regional failure pages once.
+    region: local
+
+rule_files:
+  - /etc/prometheus/rules/*.rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+      # Alerting must survive a partially-broken telemetry plane, so this path
+      # is deliberately direct: no proxy, no service mesh sidecar dependency.
+      timeout: 10s
+
+scrape_configs:
+
+  # ---------------------------------------------------------------------
+  # Traffic plane
+  # ---------------------------------------------------------------------
+  # The gateway is the source of every SLI in SPEC §5. Its /metrics endpoint is
+  # network-restricted (SPEC §2.1) — only this scraper's identity may reach
+  # :9090, enforced by the NetworkPolicy in deploy/k8s/base/networkpolicy.yaml.
+  - job_name: agentgate-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:9090"]
+        labels:
+          service: gateway
+          plane: traffic
+    metric_relabel_configs:
+      # Drop the Go runtime histograms; they are high-cardinality and the
+      # process_* / go_gc_* summaries already cover what we alert on.
+      - source_labels: [__name__]
+        regex: 'go_sched_latencies_seconds_bucket|go_gc_heap_allocs_by_size_bytes_bucket|go_gc_heap_frees_by_size_bytes_bucket'
+        action: drop
+
+  # ---------------------------------------------------------------------
+  # Trust plane
+  # ---------------------------------------------------------------------
+  - job_name: agentgate-controlplane
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["controlplane:9091"]
+        labels:
+          service: controlplane
+          plane: trust
+
+  # ---------------------------------------------------------------------
+  # Truth plane
+  # ---------------------------------------------------------------------
+  - job_name: agentgate-fleetview
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["fleetview:9092"]
+        labels:
+          service: fleetview
+          plane: truth
+
+  # fleetview computes the telemetry-trust metrics (SPEC §4.5) on a 60s cycle;
+  # they are gauges, so a 30s scrape is ample and halves the series churn.
+  - job_name: agentgate-fleetview-telemetry-trust
+    scrape_interval: 30s
+    metrics_path: /metrics/telemetry
+    static_configs:
+      - targets: ["fleetview:9092"]
+        labels:
+          service: fleetview
+          plane: truth
+
+  - job_name: agentgate-guardrails
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["guardrails:8083"]
+        labels:
+          service: guardrails
+          plane: traffic
+
+  # ---------------------------------------------------------------------
+  # Telemetry pipeline itself — "is the plane that reports on everything else
+  # healthy?" is a question that needs its own answer.
+  # ---------------------------------------------------------------------
+  - job_name: otel-collector-agent
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["otel-agent:8888"]
+        labels:
+          service: otel-collector
+          tier: agent
+
+  - job_name: otel-collector-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["otel-gateway:8888"]
+        labels:
+          service: otel-collector
+          tier: gateway
+
+  # The gateway-tier collector's Prometheus *exporter*: fleet metrics forwarded
+  # over OTLP plus the cost metrics produced by the sum connector. This is a
+  # different endpoint from the collector's self-telemetry above and both are
+  # needed — one is the pipeline's own health, the other is the payload.
+  - job_name: agentgate-otlp-metrics
+    metrics_path: /metrics
+    honor_labels: true
+    static_configs:
+      - targets: ["otel-gateway:8889"]
+        labels:
+          service: otel-collector-export
+          tier: gateway
+
+  # ---------------------------------------------------------------------
+  # Backend simulators (local only). Real environments scrape nothing here;
+  # provider health is inferred from agentgate_breaker_state and the
+  # per-backend request metrics.
+  # ---------------------------------------------------------------------
+  - job_name: mockprovider
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["mockprovider-azure:8090"]
+        labels: { service: mockprovider, backend: azure-openai }
+      - targets: ["mockprovider-bedrock:8090"]
+        labels: { service: mockprovider, backend: bedrock }
+      - targets: ["mockprovider-vllm:8090"]
+        labels: { service: mockprovider, backend: onprem-vllm }
+
+  # ---------------------------------------------------------------------
+  # Prometheus and Alertmanager themselves
+  # ---------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          service: prometheus
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+        labels:
+          service: alertmanager

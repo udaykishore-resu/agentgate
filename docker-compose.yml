@@ -1,0 +1,541 @@
+# AgentGate — full local stack.
+#
+#   make run-stack     # build + up
+#   make smoke         # end-to-end request through the gateway
+#   make stop-stack    # down, keeps volumes
+#
+# What is here and why: the whole point of AgentGate is that identity,
+# traffic and telemetry are one plane, so a local stack that omits the
+# collector or the control plane cannot exercise anything interesting. This
+# file therefore brings up all three planes plus a realistic backend fleet
+# (three mockprovider instances with different latency/failure profiles) so
+# routing, failover, breaker trips and tail sampling are all reproducible on
+# a laptop.
+#
+# Optional extras live behind compose profiles:
+#   --profile langfuse   Langfuse trace UI
+#   --profile alerting   Alertmanager
+# e.g. `docker compose --profile langfuse up -d`
+
+name: agentgate
+
+x-build-defaults: &build-defaults
+  context: .
+  dockerfile: deploy/docker/Dockerfile
+  args:
+    VERSION: ${VERSION:-dev}
+    COMMIT: ${COMMIT:-unknown}
+    BUILD_DATE: ${BUILD_DATE:-1970-01-01T00:00:00Z}
+    # Adds a static busybox so compose can run in-container HTTP probes.
+    # Production images are built with RUNTIME_VARIANT=plain (pure distroless).
+    RUNTIME_VARIANT: healthcheck
+
+x-agentgate-common: &agentgate-common
+  restart: unless-stopped
+  networks: [agentgate]
+  # The images ship no shell and run as 65532; nothing needs to write to the
+  # root filesystem, so lock it down locally too — that is how a
+  # readOnlyRootFilesystem regression gets caught before it reaches a cluster.
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-mock-common: &mock-common
+  build:
+    <<: *build-defaults
+    args:
+      SERVICE: mockprovider
+      VERSION: ${VERSION:-dev}
+      COMMIT: ${COMMIT:-unknown}
+      BUILD_DATE: ${BUILD_DATE:-1970-01-01T00:00:00Z}
+      RUNTIME_VARIANT: healthcheck
+  image: agentgate/mockprovider:${VERSION:-dev}
+  restart: unless-stopped
+  networks: [agentgate]
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  healthcheck:
+    test: ["CMD", "/busybox/busybox", "wget", "-q", "-O", "-", "http://127.0.0.1:8090/healthz"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 5s
+
+networks:
+  agentgate:
+    name: agentgate
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  promdata:
+  grafanadata:
+  lokidata:
+  usagedata:
+  gateway-tmp:
+  collector-gw-tmp:
+
+services:
+
+  # =========================================================================
+  # Traffic plane
+  # =========================================================================
+  gateway:
+    <<: *agentgate-common
+    build:
+      <<: *build-defaults
+      args:
+        SERVICE: gateway
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-1970-01-01T00:00:00Z}
+        RUNTIME_VARIANT: healthcheck
+    image: agentgate/gateway:${VERSION:-dev}
+    ports:
+      - "8080:8080"   # /v1 API
+      - "9090:9090"   # /metrics (scraped by prometheus on the compose network)
+    environment:
+      AGENTGATE_CONFIG: /etc/agentgate/agentgate.yaml
+      AGENTGATE_REDIS_ADDR: redis:6379
+      AGENTGATE_OIDC_ISSUER: http://controlplane:8081
+      AGENTGATE_OIDC_JWKS_URL: http://controlplane:8081/.well-known/jwks.json
+      AGENTGATE_OTLP_ENDPOINT: http://otel-agent:4318
+      AGENTGATE_CONTROLPLANE_URL: http://controlplane:8081
+      AGENTGATE_GUARDRAIL_URL: http://guardrails:8083
+      AGENTGATE_ENV: dev
+      AGENTGATE_LOG_LEVEL: debug
+      # SPEC §4.2 — content is never `full` by default. `redacted` is the
+      # non-prod default and still routes through the guardrail redactor.
+      AGENTGATE_CAPTURE_CONTENT: redacted
+    volumes:
+      - ./deploy/compose/agentgate.local.yaml:/etc/agentgate/agentgate.yaml:ro
+      - usagedata:/var/lib/agentgate
+      - gateway-tmp:/tmp
+    depends_on:
+      redis:
+        condition: service_healthy
+      controlplane:
+        condition: service_healthy
+      guardrails:
+        condition: service_healthy
+      mockprovider-azure:
+        condition: service_healthy
+      mockprovider-bedrock:
+        condition: service_healthy
+      mockprovider-vllm:
+        condition: service_healthy
+      otel-agent:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/busybox/busybox", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  # =========================================================================
+  # Trust plane
+  # =========================================================================
+  controlplane:
+    <<: *agentgate-common
+    build:
+      <<: *build-defaults
+      args:
+        SERVICE: controlplane
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-1970-01-01T00:00:00Z}
+        RUNTIME_VARIANT: healthcheck
+    image: agentgate/controlplane:${VERSION:-dev}
+    ports:
+      - "8081:8081"
+      - "9091:9091"
+    environment:
+      AGENTGATE_DB_DSN: postgres://agentgate:agentgate@postgres:5432/agentgate?sslmode=disable
+      # Local dev key only. In every real environment this path is a projected
+      # Key Vault / Secrets Manager volume and the key never touches an image.
+      AGENTGATE_SIGNING_KEY_PATH: /etc/agentgate/keys/signing.pem
+      # Empty = vault integration disabled, control plane falls back to the
+      # documented local key path above.
+      AGENTGATE_VAULT_ADDR: ""
+      # Empty = ServiceNow integration disabled; the promotion gate falls back
+      # to the documented manual path with identical recorded evidence
+      # (SPEC §1.4).
+      AGENTGATE_SERVICENOW_URL: ""
+      AGENTGATE_OTLP_ENDPOINT: http://otel-agent:4318
+      AGENTGATE_ENV: dev
+      AGENTGATE_LOG_LEVEL: debug
+      # Local stack only: the management API accepts an actor header instead of
+      # a bearer token, so agentctl works without a bootstrap identity. The
+      # control plane refuses this in production.
+      AGENTGATE_ALLOW_ANONYMOUS_ADMIN: "true"
+      # The promotion gate reads its telemetry-health signals from the fleet
+      # service rather than computing them a second time.
+      AGENTGATE_FLEET_URL: http://fleetview:8082
+      AGENTGATE_STATE_PATH: /var/lib/agentgate/registry.json
+      AGENTGATE_SECRETS_PATH: /var/lib/agentgate/secrets.json
+      AGENTGATE_TOKEN_AUDIENCE: https://gateway.agentgate.internal
+      AGENTGATE_OIDC_ISSUER: http://controlplane:8081
+    volumes:
+      - ./deploy/compose/keys:/etc/agentgate/keys:ro
+      - usagedata:/var/lib/agentgate
+    depends_on:
+      postgres:
+        condition: service_healthy
+      otel-agent:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/busybox/busybox", "wget", "-q", "-O", "-", "http://127.0.0.1:8081/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  # =========================================================================
+  # Truth plane
+  # =========================================================================
+  fleetview:
+    <<: *agentgate-common
+    build:
+      <<: *build-defaults
+      args:
+        SERVICE: fleetview
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-1970-01-01T00:00:00Z}
+        RUNTIME_VARIANT: healthcheck
+    image: agentgate/fleetview:${VERSION:-dev}
+    ports:
+      - "8082:8082"
+      - "9092:9092"
+    environment:
+      AGENTGATE_DB_DSN: postgres://agentgate:agentgate@postgres:5432/agentgate?sslmode=disable
+      AGENTGATE_PROM_URL: http://prometheus:9090
+      AGENTGATE_CONTROLPLANE_URL: http://controlplane:8081
+      AGENTGATE_OTLP_ENDPOINT: http://otel-agent:4318
+      AGENTGATE_ENV: dev
+      AGENTGATE_LOG_LEVEL: debug
+      # The fleet view reads the same registry snapshot the control plane
+      # writes and the same usage journal the gateway writes, so the numbers on
+      # the dashboard are the numbers the platform actually recorded.
+      AGENTGATE_STATE_PATH: /var/lib/agentgate/registry.json
+      AGENTGATE_USAGE_DIR: /var/lib/agentgate/usage
+      AGENTGATE_MIN_COMPLETENESS: "0.98"
+      AGENTGATE_DAILY_CEILINGS: "CC-4471=250"
+    volumes:
+      - usagedata:/var/lib/agentgate
+    depends_on:
+      postgres:
+        condition: service_healthy
+      controlplane:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/busybox/busybox", "wget", "-q", "-O", "-", "http://127.0.0.1:8082/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  guardrails:
+    <<: *agentgate-common
+    build:
+      <<: *build-defaults
+      args:
+        SERVICE: guardrails
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-1970-01-01T00:00:00Z}
+        RUNTIME_VARIANT: healthcheck
+    image: agentgate/guardrails:${VERSION:-dev}
+    ports:
+      - "8083:8083"
+    environment:
+      # `builtin` = regex/entropy PII + denylist, no external dependency, so
+      # the local stack exercises real block/redact paths offline.
+      AGENTGATE_GUARDRAIL_MODE: builtin
+      AGENTGATE_OTLP_ENDPOINT: http://otel-agent:4318
+      AGENTGATE_ENV: dev
+      AGENTGATE_LOG_LEVEL: debug
+    depends_on:
+      otel-agent:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/busybox/busybox", "wget", "-q", "-O", "-", "http://127.0.0.1:8083/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # =========================================================================
+  # Backend fleet — three profiles so routing/failover/breaker are testable
+  # =========================================================================
+  # Fast and reliable: the weighted primary.
+  mockprovider-azure:
+    <<: *mock-common
+    ports:
+      - "8090:8090"
+    environment:
+      MOCK_LATENCY_MS: "180"
+      MOCK_FAILURE_RATE: "0.01"
+      # Optional: selects the wire dialect the mock speaks so the matching
+      # provider adapter is exercised end to end.
+      MOCK_PROVIDER_FLAVOR: azure-openai
+
+  # Slower, noticeably flakier: makes retry budget and failover observable.
+  mockprovider-bedrock:
+    <<: *mock-common
+    ports:
+      - "8091:8090"
+    environment:
+      MOCK_LATENCY_MS: "420"
+      MOCK_FAILURE_RATE: "0.08"
+      MOCK_PROVIDER_FLAVOR: bedrock
+
+  # Slow but very reliable: the priority-2 on-prem failover tier.
+  mockprovider-vllm:
+    <<: *mock-common
+    ports:
+      - "8092:8090"
+    environment:
+      MOCK_LATENCY_MS: "900"
+      MOCK_FAILURE_RATE: "0.00"
+      MOCK_PROVIDER_FLAVOR: openai
+
+  # =========================================================================
+  # State
+  # =========================================================================
+  postgres:
+    image: postgres:16.6-alpine
+    restart: unless-stopped
+    networks: [agentgate]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: agentgate
+      POSTGRES_PASSWORD: agentgate
+      POSTGRES_DB: agentgate
+      # Deterministic collation so index ordering matches CI and the cloud
+      # flexible-server/RDS instances.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/compose/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentgate -d agentgate"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    networks: [agentgate]
+    ports:
+      - "6379:6379"
+    # Rate-limit buckets and cache entries are both reconstructible, so
+    # persistence is off and maxmemory eviction is allowed. Losing Redis costs
+    # a cache-cold window, never correctness.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # =========================================================================
+  # Telemetry pipeline (SPEC §4.4) — two tiers, exactly as in production
+  # =========================================================================
+  otel-agent:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    restart: unless-stopped
+    networks: [agentgate]
+    # The compose variant of the agent-tier config: same pipeline, minus the
+    # k8sattributes processor, which cannot start without a Kubernetes API.
+    command: ["--config=/etc/otel/collector-agent.yaml"]
+    ports:
+      - "4317:4317"   # OTLP/gRPC — agents on the host can point here
+      - "4318:4318"   # OTLP/HTTP
+      - "8888:8888"   # collector self-telemetry
+    environment:
+      # The agent tier normally derives these from the Downward API; compose
+      # supplies them so resource attributes look identical locally.
+      K8S_NODE_NAME: local
+      # Hostname only — the loadbalancing exporter's DNS resolver adds the port.
+      OTEL_GATEWAY_HOST: otel-gateway
+      AGENTGATE_ENV: dev
+    volumes:
+      - ./deploy/otel/collector-agent.compose.yaml:/etc/otel/collector-agent.yaml:ro
+    depends_on:
+      otel-gateway:
+        condition: service_started
+
+  otel-gateway:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    restart: unless-stopped
+    networks: [agentgate]
+    command: ["--config=/etc/otel/collector-gateway.yaml"]
+    ports:
+      - "14317:4317"  # OTLP/gRPC in (tier 2)
+      - "8889:8889"   # prometheus exporter — fleet metrics + cost pipeline
+      - "8898:8888"   # collector self-telemetry
+    environment:
+      TRACES_OTLP_ENDPOINT: jaeger:4317
+      CONTENT_OTLP_ENDPOINT: jaeger:4317
+      LOKI_ENDPOINT: http://loki:3100/otlp
+      AGENTGATE_ENV: dev
+      # Baseline tail-sampling rate, overridden per environment (SPEC §4.4).
+      TAIL_SAMPLING_BASELINE_PERCENT: "5"
+    volumes:
+      - ./deploy/otel/collector-gateway.yaml:/etc/otel/collector-gateway.yaml:ro
+      - collector-gw-tmp:/tmp
+    depends_on:
+      jaeger:
+        condition: service_started
+      loki:
+        condition: service_started
+
+  jaeger:
+    # Trace backend for the local stack. In the cloud this is Langfuse plus the
+    # managed backend (Azure Monitor / X-Ray); the collector config exports to
+    # an OTLP endpoint either way, so only the endpoint changes.
+    image: jaegertracing/all-in-one:1.65.0
+    restart: unless-stopped
+    networks: [agentgate]
+    ports:
+      - "16686:16686"  # UI
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      # Keep the local trace store bounded; this is a laptop, not a backend.
+      MEMORY_MAX_TRACES: "50000"
+
+  loki:
+    image: grafana/loki:3.3.2
+    restart: unless-stopped
+    networks: [agentgate]
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - lokidata:/loki
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    restart: unless-stopped
+    networks: [agentgate]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    ports:
+      - "9099:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/rules:/etc/prometheus/rules:ro
+      - promdata:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    profiles: ["alerting"]
+    restart: unless-stopped
+    networks: [agentgate]
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./deploy/prometheus/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./deploy/prometheus/templates:/etc/alertmanager/templates:ro
+      # Local secret files so the receivers' *_file references resolve. Real
+      # environments project these from Key Vault / Secrets Manager.
+      - ./deploy/compose/alertmanager-secrets:/etc/alertmanager/secrets:ro
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    restart: unless-stopped
+    networks: [agentgate]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Local only. Anonymous viewer access keeps `make run-stack` frictionless;
+      # every deployed environment uses Entra ID / IAM SSO instead.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: light
+      GF_FEATURE_TOGGLES_ENABLE: traceToMetrics
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
+  # =========================================================================
+  # Langfuse (optional) — `docker compose --profile langfuse up -d`
+  # =========================================================================
+  # Langfuse v2 needs only Postgres, so it shares the stack's instance via the
+  # `langfuse` database created by deploy/compose/postgres-init. (Langfuse v3
+  # additionally requires ClickHouse, MinIO and Redis for its async ingestion
+  # workers — that is more moving parts than a laptop stack should carry, which
+  # is why v2 is pinned here. The gateway-tier collector exports OTLP to it in
+  # exactly the same way either way.)
+  langfuse:
+    image: langfuse/langfuse:2.95.0
+    profiles: ["langfuse"]
+    restart: unless-stopped
+    networks: [agentgate]
+    ports:
+      - "3001:3000"
+    environment:
+      DATABASE_URL: postgresql://agentgate:agentgate@postgres:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3001
+      # Local-only development secrets. Rotate/replace via the secret store in
+      # every deployed environment — these values are public in this repo.
+      NEXTAUTH_SECRET: local-dev-nextauth-secret-change-me
+      SALT: local-dev-salt-change-me
+      ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      AUTH_DISABLE_SIGNUP: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy

@@ -1,0 +1,2187 @@
+openapi: 3.1.0
+
+info:
+  title: AgentGate Gateway API
+  version: "1.0.0"
+  summary: Provider-agnostic model API for enterprise agent workloads.
+  description: |
+    The AgentGate gateway is the traffic plane every agent passes through. It is wire-compatible
+    with the OpenAI Chat Completions shape, so existing SDKs and agent frameworks work against it
+    unmodified: point the SDK's `base_url` at the gateway and present an AgentGate access token as
+    the bearer credential.
+
+    ## Compatibility guarantee (frozen)
+
+    This document is the published v1 contract. It is frozen in the following precise sense:
+
+    * Fields **may be added** to request and response bodies, and new response headers may appear.
+      A client must ignore fields it does not recognise.
+    * **No field is removed and no field is retyped.** A field that is a string today is a string
+      for the life of v1.
+    * **No error `code` is repurposed**, and **no `code` changes its HTTP status**. The
+      code-to-status mapping in `internal/httpx/problem.go` is the single source of truth and is
+      reproduced here verbatim.
+    * New error codes may be added. A client must treat an unrecognised `code` as it treats the
+      HTTP status class it arrived with.
+    * Any change that breaks one of the rules above is a **`/v2`**, published as a separate base
+      path, run side by side with `/v1`, with a published deprecation window. It is never shipped
+      as a change to this document.
+
+    ## Authentication
+
+    Every `/v1/*` call requires `Authorization: Bearer <access token>` issued by the AgentGate
+    control plane (`POST /oauth2/token`; see `controlplane.v1.yaml`). The token carries the agent's
+    identity, environment, cost centre and pool entitlement as signed claims — the gateway never
+    calls the control plane on the request path, which is why a control-plane outage does not stop
+    agents that are already running.
+
+    `/healthz`, `/readyz` and the `/admin/*` routes are **not** token-authenticated. They are
+    network-restricted (see `deploy/k8s/base/networkpolicy.yaml`) because they must keep working
+    when the control plane is the thing that is broken.
+
+    ## Prometheus scrape endpoint
+
+    `GET /metrics` is **not** served by this API. Each binary exposes it on a separate operator
+    listener (`cmd/gateway/main.go`, `AGENTGATE_METRICS_ADDR`) so that scrape traffic and request
+    traffic can be given different network policies. It is therefore deliberately absent from this
+    document.
+
+    ## Local development identity
+
+    When `identity.allow_unverified` is set — refused by config validation in staging and
+    production — the gateway synthesises a developer identity instead of verifying a token, and
+    reads `x-agentgate-dev-tenant`, `x-agentgate-dev-team` and `x-agentgate-dev-agent` to name it.
+    Those headers have no effect in any deployed environment and are not part of the contract.
+  contact:
+    name: AI Platform team
+    email: ai-platform@client.example
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://gateway.agentgate.internal
+    description: Production gateway (internal load balancer, private DNS)
+  - url: https://gateway.staging.agentgate.internal
+    description: Staging gateway
+  - url: http://localhost:8080
+    description: Local development stack (docker-compose)
+
+tags:
+  - name: chat
+    description: Chat completions, unary and streaming.
+  - name: embeddings
+    description: Embedding vectors.
+  - name: models
+    description: Logical models the presented token is entitled to.
+  - name: preflight
+    description: Token estimation before a request is spent.
+  - name: operations
+    description: |
+      Liveness and readiness. Unauthenticated, network-restricted. Intended for the orchestrator
+      and for on-call engineers, not for agents.
+  - name: admin
+    description: |
+      **Operator-only, network-restricted.** These routes are not token-authenticated and must be
+      unreachable from agent networks. They exist so that an on-call engineer can change routing
+      and purge cached content during an incident without a deployment. Exposing them to callers
+      would hand any agent the ability to drain the fleet's backends.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/chat/completions:
+    post:
+      tags: [chat]
+      operationId: createChatCompletion
+      summary: Create a chat completion
+      description: |
+        Runs the full policy chain — authentication, authorisation, admission, request rate limit,
+        token quota reserve, input guardrail, cache lookup, request transformation, routing,
+        invocation with retry/failover/circuit breaking, response transformation, output guardrail,
+        cache store — and returns an OpenAI-shaped completion.
+
+        Set `stream: true` for a `text/event-stream` response. See the `200` response for the exact
+        frame sequence.
+
+        `model` is a **logical** model name (`general-chat`), never a provider deployment name. The
+        concrete backend model that served the request is reported in the `x-agentgate-model`
+        response header and on the trace, where an operator needs it and an application does not.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/RequestPriority'
+        - $ref: '#/components/parameters/CacheMode'
+        - $ref: '#/components/parameters/PoolOverride'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/ClientRequestId'
+        - $ref: '#/components/parameters/TraceParent'
+        - $ref: '#/components/parameters/TraceState'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+            examples:
+              unary:
+                summary: Unary completion with metadata
+                value:
+                  model: general-chat
+                  messages:
+                    - role: system
+                      content: You are a dispute triage assistant. Answer in two sentences.
+                    - role: user
+                      content: Cardholder disputes a 42.10 GBP contactless transaction from 3 March.
+                  max_tokens: 256
+                  temperature: 0.2
+                  metadata:
+                    session_id: sess_8f21c4
+                    conversation_id: conv_9
+                    step: classify
+                    tags: [dispute, tier2]
+              streaming:
+                summary: Streaming completion asking for a final usage frame
+                value:
+                  model: general-chat
+                  messages:
+                    - role: user
+                      content: Summarise the attached chargeback reason codes.
+                  max_tokens: 1024
+                  temperature: 0.2
+                  stream: true
+                  stream_options:
+                    include_usage: true
+              toolCalling:
+                summary: Tool-calling request
+                value:
+                  model: long-context
+                  messages:
+                    - role: user
+                      content: What is the current status of case 88213?
+                  tools:
+                    - type: function
+                      function:
+                        name: get_case_status
+                        description: Look up a dispute case by id.
+                        parameters:
+                          type: object
+                          properties:
+                            case_id:
+                              type: string
+                          required: [case_id]
+                  tool_choice: auto
+                  max_tokens: 512
+      responses:
+        '200':
+          description: |
+            A completion. The content type depends on the request:
+
+            * `stream: false` (default) — `application/json`, a `ChatResponse`.
+            * `stream: true` — `text/event-stream`, the frame sequence documented below.
+
+            ### Streaming frame sequence
+
+            Frames are separated by a blank line. Unnamed `data:` frames carry OpenAI
+            `chat.completion.chunk` objects and are what a strict OpenAI client consumes. Named
+            `event:` frames carry AgentGate information and are ignorable by such a client. A
+            comment line beginning with `:` is a heartbeat, emitted every `stream.heartbeat`
+            (default 15s) so that idle enterprise proxies do not drop a long generation.
+
+            ```text
+            event: agentgate.failover
+            data: {"request_id":"req_2f9c0a1d4b8e4c7f9a11","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","from":"bedrock/claude-haiku","to":"azure-openai/gpt-4o-mini","pool":"general-chat","attempts":2}
+
+            data: {"id":"chatcmpl-9f2","object":"chat.completion.chunk","created":1774526521,"model":"general-chat","choices":[{"index":0,"delta":{"role":"assistant","content":"The "}}]}
+
+            data: {"id":"chatcmpl-9f2","object":"chat.completion.chunk","created":1774526521,"model":"general-chat","choices":[{"index":0,"delta":{"content":"dispute "}}]}
+
+            : heartbeat
+
+            data: {"id":"chatcmpl-9f2","object":"chat.completion.chunk","created":1774526522,"model":"general-chat","choices":[{"index":0,"delta":{"content":"qualifies."}}]}
+
+            data: {"id":"chatcmpl-9f2","object":"chat.completion.chunk","created":1774526522,"model":"general-chat","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+            event: agentgate.usage
+            data: {"request_id":"req_2f9c0a1d4b8e4c7f9a11","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","provider":"azure-openai","backend":"azure-openai/gpt-4o-mini","model":"general-chat","attempts":2,"usage":{"prompt_tokens":1842,"completion_tokens":311,"total_tokens":2153},"cost_usd":0.000462,"estimated":false,"stalls":0}
+
+            data: [DONE]
+            ```
+
+            **`agentgate.failover`** is emitted **first**, before any content frame, and only when
+            the stream was opened on a different backend than the one first tried. Most streams do
+            not carry it. It names the backend moved `from`, the backend moved `to`, the `pool`,
+            and the number of `attempts` made.
+
+            Because a stream is only ever failed over *before* the first content byte, this frame
+            can never appear after one: receiving it is positive evidence that no partial content
+            was discarded and nothing was replayed. It exists so that an otherwise invisible
+            routing decision is auditable from the client side — which is what lets a consuming
+            team correlate a latency outlier with a provider incident without asking the platform
+            team.
+
+            **`agentgate.usage`** is emitted immediately before `[DONE]`, and only when
+            `stream_options.include_usage` is `true`. Its `estimated` field is `true` when the
+            provider did not report usage and the gateway counted the completion itself; an
+            estimated figure is never presented as a measured one.
+
+            **`error`** replaces the remainder of the stream when a failure occurs after the status
+            line has been sent. The payload is a `Problem`. When it appears there is no `[DONE]`.
+
+            > **A stream that ends without `data: [DONE]` failed.** Once the first content byte has
+            > been written the HTTP status is long gone and cannot be changed, so the failure is
+            > carried in band. A client must treat a truncated stream as an error, not as a short
+            > answer.
+
+            A cache hit on a streaming request is replayed as a single content chunk followed by
+            `agentgate.usage` (carrying `cache` and `savings_usd` instead of `provider`) and
+            `[DONE]`. It is still a stream as far as the caller's parser is concerned, and it never
+            carries a failover frame — nothing was routed.
+
+            Before the first content byte the gateway may retry or fail over to another backend;
+            when it fails over, it says so with `agentgate.failover`. After the first content byte
+            the stream is never restarted.
+          headers:
+            x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+            x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+            x-agentgate-provider: {$ref: '#/components/headers/Provider'}
+            x-agentgate-model: {$ref: '#/components/headers/BackendModel'}
+            x-agentgate-pool: {$ref: '#/components/headers/PoolUsed'}
+            x-agentgate-attempts: {$ref: '#/components/headers/Attempts'}
+            x-agentgate-cache: {$ref: '#/components/headers/CacheResult'}
+            x-agentgate-tokens-input: {$ref: '#/components/headers/TokensInput'}
+            x-agentgate-tokens-output: {$ref: '#/components/headers/TokensOutput'}
+            x-agentgate-cost-usd: {$ref: '#/components/headers/CostUSD'}
+            x-agentgate-ratelimit-limit-tokens: {$ref: '#/components/headers/RateLimitLimit'}
+            x-agentgate-ratelimit-remaining-tokens: {$ref: '#/components/headers/RateLimitRemaining'}
+            x-agentgate-ratelimit-reset: {$ref: '#/components/headers/RateLimitReset'}
+            x-agentgate-guardrail: {$ref: '#/components/headers/Guardrail'}
+            x-agentgate-degraded: {$ref: '#/components/headers/Degraded'}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+              examples:
+                completion:
+                  summary: Unary completion
+                  value:
+                    id: chatcmpl-9f2c1a
+                    object: chat.completion
+                    created: 1774526521
+                    model: general-chat
+                    choices:
+                      - index: 0
+                        message:
+                          role: assistant
+                          content: >-
+                            The transaction qualifies for a chargeback under reason code 13.1.
+                            Recommend routing to tier 2 with the cardholder statement attached.
+                        finish_reason: stop
+                    usage:
+                      prompt_tokens: 1842
+                      completion_tokens: 311
+                      total_tokens: 2153
+                    system_fingerprint: fp_44709d6fcb
+            text/event-stream:
+              x-agentgate-sse-frames:
+                description: |
+                  The payload schema of each frame kind. SSE is a framed text protocol, so the
+                  media type's own schema can only be `string`; these are the schemas the frames
+                  inside it conform to.
+                unnamedData:
+                  $ref: '#/components/schemas/Chunk'
+                agentgateFailover:
+                  $ref: '#/components/schemas/StreamFailoverEvent'
+                agentgateUsage:
+                  $ref: '#/components/schemas/StreamUsageEvent'
+                error:
+                  $ref: '#/components/schemas/Problem'
+              schema:
+                type: string
+                description: |
+                  Server-Sent Events. Each unnamed `data:` frame is a `Chunk` encoded as JSON,
+                  except the final `data: [DONE]` sentinel, which is the literal string `[DONE]`.
+                  Named frames are `agentgate.failover`, whose payload is a `StreamFailoverEvent`;
+                  `agentgate.usage`, whose payload is a `StreamUsageEvent`; and `error`, whose
+                  payload is a `Problem`. Comment lines beginning with `:` are heartbeats and carry
+                  no data. The worked frame sequence is in this response's description.
+              examples:
+                stream:
+                  summary: The common case - content frames, a heartbeat, the usage frame, the sentinel
+                  value: |
+                    data: {"id":"chatcmpl-9f2","object":"chat.completion.chunk","created":1774526521,"model":"general-chat","choices":[{"index":0,"delta":{"role":"assistant","content":"The "}}]}
+
+                    data: {"id":"chatcmpl-9f2","object":"chat.completion.chunk","created":1774526521,"model":"general-chat","choices":[{"index":0,"delta":{"content":"dispute qualifies."}}]}
+
+                    : heartbeat
+
+                    data: {"id":"chatcmpl-9f2","object":"chat.completion.chunk","created":1774526522,"model":"general-chat","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+                    event: agentgate.usage
+                    data: {"request_id":"req_2f9c0a1d4b8e4c7f9a11","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","provider":"azure-openai","backend":"azure-openai/gpt-4o-mini","model":"general-chat","attempts":1,"usage":{"prompt_tokens":1842,"completion_tokens":311,"total_tokens":2153},"cost_usd":0.000462,"estimated":false,"stalls":0}
+
+                    data: [DONE]
+                failoverFrame:
+                  summary: A stream opened on a second backend - the failover frame comes first
+                  value: |
+                    event: agentgate.failover
+                    data: {"request_id":"req_2f9c0a1d4b8e4c7f9a11","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","from":"bedrock/claude-haiku","to":"azure-openai/gpt-4o-mini","pool":"general-chat","attempts":2}
+
+                    data: {"id":"chatcmpl-9f2","object":"chat.completion.chunk","created":1774526521,"model":"general-chat","choices":[{"index":0,"delta":{"role":"assistant","content":"The dispute qualifies."}}]}
+
+                    data: {"id":"chatcmpl-9f2","object":"chat.completion.chunk","created":1774526522,"model":"general-chat","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+                    data: [DONE]
+                errorFrame:
+                  summary: Failure after the first content byte — no [DONE]
+                  value: |
+                    data: {"id":"chatcmpl-9f2","object":"chat.completion.chunk","created":1774526521,"model":"general-chat","choices":[{"index":0,"delta":{"role":"assistant","content":"The "}}]}
+
+                    event: error
+                    data: {"type":"https://agentgate.internal/errors/guardrail_blocked","title":"Blocked by content safety policy","status":403,"detail":"the response was blocked mid-stream by content safety policy (pii)","code":"guardrail_blocked","request_id":"req_2f9c0a1d4b8e4c7f9a11","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/UnknownModel'}
+        '408': {$ref: '#/components/responses/ClientTimeout'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '413': {$ref: '#/components/responses/ContextTooLarge'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '502': {$ref: '#/components/responses/ProviderError'}
+        '503': {$ref: '#/components/responses/NoHealthyBackend'}
+        '504': {$ref: '#/components/responses/ProviderTimeout'}
+
+  /v1/embeddings:
+    post:
+      tags: [embeddings]
+      operationId: createEmbeddings
+      summary: Create embedding vectors
+      description: |
+        Requires the `models:embed` scope. The response `model` field is rewritten to the logical
+        model name the caller asked for. The response cache is not consulted for this operation.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/RequestPriority'
+        - $ref: '#/components/parameters/PoolOverride'
+        - $ref: '#/components/parameters/ClientRequestId'
+        - $ref: '#/components/parameters/TraceParent'
+        - $ref: '#/components/parameters/TraceState'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmbeddingsRequest'
+            examples:
+              batch:
+                summary: Batch of inputs
+                value:
+                  model: text-embed
+                  input:
+                    - Cardholder disputes a contactless transaction.
+                    - Merchant provided a signed delivery receipt.
+                  encoding_format: float
+      responses:
+        '200':
+          description: Embedding vectors, one per input, in input order.
+          headers:
+            x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+            x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+            x-agentgate-provider: {$ref: '#/components/headers/Provider'}
+            x-agentgate-model: {$ref: '#/components/headers/BackendModel'}
+            x-agentgate-pool: {$ref: '#/components/headers/PoolUsed'}
+            x-agentgate-attempts: {$ref: '#/components/headers/Attempts'}
+            x-agentgate-tokens-input: {$ref: '#/components/headers/TokensInput'}
+            x-agentgate-tokens-output: {$ref: '#/components/headers/TokensOutput'}
+            x-agentgate-cost-usd: {$ref: '#/components/headers/CostUSD'}
+            x-agentgate-ratelimit-limit-tokens: {$ref: '#/components/headers/RateLimitLimit'}
+            x-agentgate-ratelimit-remaining-tokens: {$ref: '#/components/headers/RateLimitRemaining'}
+            x-agentgate-ratelimit-reset: {$ref: '#/components/headers/RateLimitReset'}
+            x-agentgate-degraded: {$ref: '#/components/headers/Degraded'}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmbeddingsResponse'
+              examples:
+                vectors:
+                  value:
+                    object: list
+                    data:
+                      - object: embedding
+                        index: 0
+                        embedding: [0.0023, -0.0091, 0.0144]
+                      - object: embedding
+                        index: 1
+                        embedding: [-0.0117, 0.0042, 0.0308]
+                    model: text-embed
+                    usage:
+                      prompt_tokens: 24
+                      completion_tokens: 0
+                      total_tokens: 24
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/UnknownModel'}
+        '408': {$ref: '#/components/responses/ClientTimeout'}
+        '413': {$ref: '#/components/responses/ContextTooLarge'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '502': {$ref: '#/components/responses/ProviderError'}
+        '503': {$ref: '#/components/responses/NoHealthyBackend'}
+        '504': {$ref: '#/components/responses/ProviderTimeout'}
+
+  /v1/token-count:
+    post:
+      tags: [preflight]
+      operationId: countTokens
+      summary: Estimate tokens and report quota headroom
+      description: |
+        A pre-flight estimate. The request body is a `ChatRequest`; it is validated and estimated
+        but no backend is called, no tokens are reserved against the quota, and no cache entry is
+        read or written. Use it to decide whether to trim context before spending a request.
+
+        The estimate is produced by the gateway's own estimator, not by a provider tokenizer, so it
+        is approximate. `estimated` is always `true`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/PoolOverride'
+        - $ref: '#/components/parameters/ClientRequestId'
+        - $ref: '#/components/parameters/TraceParent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+            examples:
+              preflight:
+                value:
+                  model: long-context
+                  messages:
+                    - role: user
+                      content: <a very long document>
+                  max_tokens: 2048
+      responses:
+        '200':
+          description: The estimate and the agent's current quota headroom.
+          headers:
+            x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+            x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+            x-agentgate-pool: {$ref: '#/components/headers/PoolUsed'}
+            x-agentgate-ratelimit-limit-tokens: {$ref: '#/components/headers/RateLimitLimit'}
+            x-agentgate-ratelimit-remaining-tokens: {$ref: '#/components/headers/RateLimitRemaining'}
+            x-agentgate-ratelimit-reset: {$ref: '#/components/headers/RateLimitReset'}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenCountResponse'
+              examples:
+                estimate:
+                  value:
+                    model: long-context
+                    estimated_input_tokens: 91422
+                    context_window: 128000
+                    max_output_tokens: 8192
+                    estimated: true
+                    monthly_tokens_used: 41220331
+                    monthly_token_budget: 900000000
+                    tokens_per_minute_limit: 120000
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/UnknownModel'}
+        '413': {$ref: '#/components/responses/ContextTooLarge'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /v1/models:
+    get:
+      tags: [models]
+      operationId: listModels
+      summary: List the logical models this token may use
+      description: |
+        Returns only models whose pool appears in the token's `model_pools` entitlement. A model
+        that exists on the platform but that this agent has not been granted is absent, not
+        forbidden: the list is what the caller may actually use.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ClientRequestId'
+        - $ref: '#/components/parameters/TraceParent'
+      responses:
+        '200':
+          description: The entitled logical models, sorted by id.
+          headers:
+            x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+            x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelList'
+              examples:
+                entitled:
+                  value:
+                    object: list
+                    data:
+                      - id: general-chat
+                        object: model
+                        created: 0
+                        owned_by: agentgate
+                        context_window: 128000
+                        max_output_tokens: 4096
+                        capabilities: [chat, tools, streaming]
+                        pool: general-chat
+                      - id: long-context
+                        object: model
+                        created: 0
+                        owned_by: agentgate
+                        context_window: 200000
+                        max_output_tokens: 8192
+                        capabilities: [chat, streaming]
+                        pool: long-context
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /v1/models/{id}:
+    get:
+      tags: [models]
+      operationId: getModel
+      summary: Describe one logical model
+      description: |
+        Returns `404 unknown_model` when the model does not exist **or** when the caller is not
+        entitled to it. The two cases are deliberately indistinguishable: reporting "exists but
+        forbidden" enumerates the platform's model inventory to every tenant.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Logical model name, for example `general-chat`.
+          schema:
+            type: string
+          example: general-chat
+        - $ref: '#/components/parameters/ClientRequestId'
+        - $ref: '#/components/parameters/TraceParent'
+      responses:
+        '200':
+          description: The logical model.
+          headers:
+            x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+            x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/UnknownModel'}
+        '500': {$ref: '#/components/responses/InternalError'}
+
+  /healthz:
+    get:
+      tags: [operations]
+      operationId: liveness
+      summary: Liveness probe
+      description: |
+        Reports that the process is running. It deliberately depends on nothing downstream: a
+        provider outage must not cause the orchestrator to restart otherwise healthy pods.
+        Unauthenticated and network-restricted.
+      security: []
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              examples:
+                alive:
+                  value:
+                    status: ok
+                    service: agentgate-gateway
+                    env: prod
+                    version:
+                      version: 1.4.2
+                      commit: 9f21c4ade1
+                      build_date: "2026-08-19T09:11:44Z"
+                      go_version: go1.24.7
+                      platform: linux/amd64
+                    uptime_seconds: 84213
+
+  /readyz:
+    get:
+      tags: [operations]
+      operationId: readiness
+      summary: Readiness probe
+      description: |
+        Reports whether the gateway can serve a request. It depends on the things a request needs:
+        at least one available backend, the rate limiter, and the current saturation and retry
+        ratios. Returns `503` when no backend is available or when the server has not yet been
+        marked ready. Unauthenticated and network-restricted.
+      security: []
+      responses:
+        '200':
+          description: Ready to take traffic.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+              examples:
+                ready:
+                  value:
+                    status: ready
+                    checks:
+                      backends_available: 3
+                      rate_limiter: true
+                      rate_limiter_degraded: false
+                      concurrency_saturation: 0.31
+                      retry_ratio: 0.02
+        '503':
+          description: |
+            Not ready. Either the server has not been marked ready yet (`{"status":"starting"}`)
+            or every backend in every pool is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+              examples:
+                starting:
+                  summary: Still starting
+                  value:
+                    status: starting
+                notReady:
+                  summary: No backend available
+                  value:
+                    status: not_ready
+                    checks:
+                      backends_available: 0
+                      rate_limiter: true
+                      concurrency_saturation: 0.02
+                      retry_ratio: 0.0
+
+  /admin/backends:
+    get:
+      tags: [admin]
+      operationId: adminListBackends
+      summary: Show routing state for every backend (operator-only)
+      description: |
+        **Operator-only, network-restricted, not token-authenticated.** Returns each pool's
+        backends with breaker state, in-flight count, success and failure counters, drain flag and
+        last error. This is what an on-call engineer reads when deciding whether to drain a
+        backend.
+      security: []
+      responses:
+        '200':
+          description: Backends by pool name.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/BackendStatus'
+              examples:
+                state:
+                  value:
+                    general-chat:
+                      - name: azure-openai/gpt-4o-mini
+                        provider: azure-openai
+                        model: gpt-4o-mini
+                        priority: 1
+                        weight: 60
+                        breaker:
+                          name: azure-openai/gpt-4o-mini
+                          state: closed
+                          failure_rate: 0.02
+                          observed: 50
+                          consecutive_failures: 0
+                        inflight: 4
+                        successes: 91204
+                        failures: 88
+                        drained: false
+                        max_classification: confidential
+
+  /admin/backends/{pool}/{backend}/drain:
+    post:
+      tags: [admin]
+      operationId: adminDrainBackend
+      summary: Take a backend out of rotation (operator-only)
+      description: |
+        **Operator-only, network-restricted, not token-authenticated.** Removes a backend from
+        selection without a restart. In-flight requests are not cancelled. The change is logged at
+        WARN with the pool and backend name.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/AdminPool'
+        - $ref: '#/components/parameters/AdminBackend'
+      responses:
+        '200':
+          description: The backend's state after draining.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackendStatus'
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /admin/backends/{pool}/{backend}/undrain:
+    post:
+      tags: [admin]
+      operationId: adminUndrainBackend
+      summary: Return a backend to rotation (operator-only)
+      description: |
+        **Operator-only, network-restricted, not token-authenticated.** The inverse of `drain`.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/AdminPool'
+        - $ref: '#/components/parameters/AdminBackend'
+      responses:
+        '200':
+          description: The backend's state after returning to rotation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackendStatus'
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /admin/cache/purge:
+    post:
+      tags: [admin]
+      operationId: adminPurgeCache
+      summary: Drop cached responses (operator-only)
+      description: |
+        **Operator-only, network-restricted, not token-authenticated.** The emergency control for
+        when a cached answer is suspected to be wrong or unsafe. Omitting `tenant` purges every
+        tenant's entries. The purge is logged at WARN with the tenant and the number of entries
+        removed.
+      security: []
+      parameters:
+        - name: tenant
+          in: query
+          required: false
+          description: Purge only this tenant's entries. Omit to purge all tenants.
+          schema:
+            type: string
+          example: fsclient
+      responses:
+        '200':
+          description: The number of entries removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [purged, tenant]
+                properties:
+                  purged:
+                    type: integer
+                    description: Number of cache entries removed.
+                  tenant:
+                    type: string
+                    description: The tenant filter that was applied; empty means all tenants.
+              examples:
+                purged:
+                  value:
+                    purged: 2841
+                    tenant: fsclient
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        An AgentGate access token issued by the control plane's `/oauth2/token` endpoint, signed
+        RS256 and verifiable against the control plane's JWKS. The gateway checks signature,
+        issuer, audience, expiry and replay window, then enforces on the signed claims: `env`,
+        `scopes`, `model_pools`, `cost_center`, `agent_version`.
+
+  parameters:
+
+    SessionId:
+      name: x-agentgate-session-id
+      in: header
+      required: false
+      description: |
+        Conversation or session correlation id. It appears on every span produced for this request,
+        which is how a multi-step agent run is reconstructed as one story. When absent the gateway
+        falls back to `metadata.session_id` in the request body.
+      schema:
+        type: string
+        maxLength: 128
+      example: sess_8f21c4
+
+    RequestPriority:
+      name: x-agentgate-request-priority
+      in: header
+      required: false
+      description: |
+        Selects the pool tier and queue discipline. `batch` traffic is shed before `interactive`
+        traffic when the gateway's concurrency ceiling is reached. Any unrecognised value is read
+        as `interactive`, because an unlabelled request is more likely to have a human behind it.
+
+        The header can only ever **de-prioritise**: a pool declared as `batch` does not become
+        interactive because a caller asked nicely.
+      schema:
+        type: string
+        enum: [interactive, batch]
+        default: interactive
+      example: batch
+
+    CacheMode:
+      name: x-agentgate-cache
+      in: header
+      required: false
+      description: |
+        Overrides the pool's cache policy for this request. Case-insensitive.
+
+        * `on` — normal behaviour: look up, and store on a miss (this is also the default).
+        * `off` — do not look up and do not store; the response header reports `bypass`.
+        * `refresh` — skip the lookup, call the backend, and overwrite the stored entry.
+
+        The header cannot make an uncacheable request cacheable. Tool-calling requests and requests
+        above the pool's temperature ceiling still bypass the cache.
+      schema:
+        type: string
+        enum: [on, off, refresh]
+      example: refresh
+
+    PoolOverride:
+      name: x-agentgate-pool
+      in: header
+      required: false
+      description: |
+        Explicit pool override. Rejected with `400 invalid_request` when the pool does not exist,
+        and with `403 forbidden_pool` when it is not in the token's `model_pools` entitlement.
+      schema:
+        type: string
+      example: long-context
+
+    IdempotencyKey:
+      name: x-agentgate-idempotency-key
+      in: header
+      required: false
+      description: |
+        De-duplicates retried **non-streaming** requests for the configured window (default 24h).
+        The stored response is replayed for a repeat of the same key with the same body. A repeat
+        with a different body is refused with `409 idempotency_conflict`.
+
+        Ignored on streaming requests: a replayed stream would have to be re-framed, and the honest
+        behaviour is to make the caller decide.
+      schema:
+        type: string
+      example: 4a4b6a90-2c48-4c04-9d63-1c9f4a1c9d1a
+
+    ClientRequestId:
+      name: x-agentgate-request-id
+      in: header
+      required: false
+      description: |
+        A caller-supplied request id. When present and no longer than 128 characters, the gateway
+        adopts it as the request id rather than generating one, and echoes it back in the response
+        header of the same name. Use it to join gateway records to an id your own system already
+        has. When absent the gateway generates `req_<32 hex>`.
+      schema:
+        type: string
+        maxLength: 128
+      example: req_2f9c0a1d4b8e4c7f9a11
+
+    TraceParent:
+      name: traceparent
+      in: header
+      required: false
+      description: |
+        W3C Trace Context. When present the gateway continues the caller's trace rather than
+        starting a new one, so an agent run and the gateway work it caused appear as one trace.
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+      example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+    TraceState:
+      name: tracestate
+      in: header
+      required: false
+      description: W3C Trace Context vendor state, propagated unchanged.
+      schema:
+        type: string
+      example: client=t61rcWkgMzE
+
+    AdminPool:
+      name: pool
+      in: path
+      required: true
+      description: Pool name.
+      schema:
+        type: string
+      example: general-chat
+
+    AdminBackend:
+      name: backend
+      in: path
+      required: true
+      description: Backend name, as reported by `GET /admin/backends`.
+      schema:
+        type: string
+      example: azure-openai/gpt-4o-mini
+
+  headers:
+
+    RequestId:
+      description: |
+        The gateway request id for this call. Quote it in a support ticket: it is the key that ties
+        the response to the trace, the log record and the usage record.
+      schema:
+        type: string
+      example: req_2f9c0a1d4b8e4c7f9a11
+
+    TraceId:
+      description: |
+        The W3C trace id of the gateway's root span, for cross-referencing in the observability
+        backend.
+      schema:
+        type: string
+      example: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    Provider:
+      description: |
+        The provider adapter that served the call. Present only once a backend has been selected —
+        absent on a cache hit and on failures that occur before routing.
+      schema:
+        type: string
+      example: azure-openai
+
+    BackendModel:
+      description: |
+        The concrete backend model or deployment that served the call, as distinct from the logical
+        model in the request body.
+      schema:
+        type: string
+      example: gpt-4o-mini
+
+    PoolUsed:
+      description: The pool the request was routed through.
+      schema:
+        type: string
+      example: general-chat
+
+    Attempts:
+      description: |
+        Number of backend attempts made, including the successful one. Present only when at least
+        one attempt was made. A value above 1 means a retry or a failover happened.
+      schema:
+        type: integer
+        minimum: 1
+      example: 2
+
+    CacheResult:
+      description: |
+        Cache outcome. `bypass` means the request was not eligible or the caller disabled the
+        cache; `refresh` means the stored entry was deliberately overwritten; `semantic_hit` is
+        only possible on pools where semantic caching has been explicitly enabled.
+      schema:
+        type: string
+        enum: [hit, miss, bypass, refresh, semantic_hit]
+      example: miss
+
+    TokensInput:
+      description: |
+        Billed input tokens, from the provider's own usage report. Present only when usage is
+        known at the time the headers are written.
+      schema:
+        type: integer
+      example: 1842
+
+    TokensOutput:
+      description: Billed output tokens.
+      schema:
+        type: integer
+      example: 311
+
+    CostUSD:
+      description: |
+        Attributed cost of this call in USD, formatted to six decimal places. Omitted when the cost
+        is zero — a cache hit, or a backend with no price entry.
+      schema:
+        type: string
+      example: "0.000462"
+
+    RateLimitLimit:
+      description: The agent's token budget for the current window.
+      schema:
+        type: integer
+      example: 120000
+
+    RateLimitRemaining:
+      description: Tokens remaining in the current window after this request was accounted for.
+      schema:
+        type: integer
+      example: 98450
+
+    RateLimitReset:
+      description: Whole seconds until the token budget refills.
+      schema:
+        type: integer
+      example: 17
+
+    Guardrail:
+      description: |
+        Content-safety verdict for this call: `pass`, `blocked:<category>` or `redacted:<category>`.
+        `<category>` is the guardrail category that fired, for example `pii` or `denylist`.
+      schema:
+        type: string
+      examples:
+        pass:
+          value: pass
+        redacted:
+          value: redacted:pii
+        blocked:
+          value: blocked:denylist
+
+    Degraded:
+      description: |
+        Present with the value `true` when the gateway served this request with a degraded
+        dependency — typically the distributed rate limiter being unreachable, in which case limits
+        were not enforced for this call. Telling the caller the platform is degraded is what lets a
+        consuming team decide whether to retry or fall back, instead of guessing.
+      schema:
+        type: string
+        enum: ["true"]
+      example: "true"
+
+    RetryAfter:
+      description: |
+        Whole seconds to wait before retrying. Present on `429` always, and on `502`/`503` when the
+        gateway has a useful estimate. Honour it: retrying sooner is what turns a provider blip
+        into a retry storm, and the fleet-wide retry budget will shed the excess anyway.
+      schema:
+        type: integer
+        minimum: 1
+      example: 17
+
+  schemas:
+
+    Message:
+      type: object
+      description: |
+        One conversation turn. `content` is either a plain string or an array of content parts;
+        both are preserved verbatim and forwarded to the provider unchanged, so a provider that
+        supports multi-modal input receives exactly what the caller sent.
+      properties:
+        role:
+          type: string
+          description: |
+            Recognised roles are `system`, `user`, `assistant`, `tool`, `developer` and `function`.
+            Any other value is refused with `400 invalid_request` naming `messages`.
+          enum: [system, user, assistant, tool, developer, function]
+        content:
+          description: |
+            Plain text, or an array of content parts (`{"type":"text","text":"..."}` and provider-
+            specific part types). May be omitted on an assistant turn that carries only tool calls.
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: object
+                additionalProperties: true
+            - type: 'null'
+        name:
+          type: string
+          description: Optional participant name.
+        tool_calls:
+          type: array
+          description: Tool invocations requested by the model on an assistant turn.
+          items:
+            $ref: '#/components/schemas/ToolCall'
+        tool_call_id:
+          type: string
+          description: On a `tool` turn, the id of the tool call this message answers.
+      additionalProperties: false
+      examples:
+        - role: user
+          content: Cardholder disputes a 42.10 GBP contactless transaction from 3 March.
+
+    FunctionCall:
+      type: object
+      description: The function half of a tool call.
+      properties:
+        name:
+          type: string
+        arguments:
+          type: string
+          description: JSON-encoded arguments, as a string. Not a JSON object.
+      additionalProperties: false
+
+    ToolCall:
+      type: object
+      description: A model-requested tool invocation.
+      required: [id, type, function]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          description: Always `function` for the tool types v1 defines.
+        index:
+          type: [integer, 'null']
+          description: |
+            Position of this tool call when it is being assembled across streaming chunks. Absent
+            on a unary response.
+        function:
+          $ref: '#/components/schemas/FunctionCall'
+      additionalProperties: false
+
+    Tool:
+      type: object
+      description: A tool definition offered to the model.
+      required: [type, function]
+      properties:
+        type:
+          type: string
+          description: Always `function` for the tool types v1 defines.
+        function:
+          type: object
+          description: |
+            The function schema, forwarded to the provider verbatim. It is not interpreted by the
+            gateway, so a provider-specific extension inside it does not require a gateway release.
+          additionalProperties: true
+      additionalProperties: false
+
+    StreamOptions:
+      type: object
+      description: OpenAI streaming options.
+      properties:
+        include_usage:
+          type: boolean
+          default: false
+          description: |
+            When true, the gateway emits an `event: agentgate.usage` frame carrying final usage and
+            cost immediately before `data: [DONE]`.
+      additionalProperties: false
+
+    Metadata:
+      type: object
+      description: |
+        Caller-supplied context joined onto the trace. **It is stripped before the request reaches
+        a provider**: it is gateway context, not model input, and forwarding it would both cost
+        tokens and leak internal identifiers to a third party.
+      properties:
+        session_id:
+          type: string
+          description: |
+            Session correlation id. Used when the `x-agentgate-session-id` header is absent.
+        conversation_id:
+          type: string
+        step:
+          type: string
+          description: The agent step this call belongs to, for example `classify` or `summarise`.
+        tags:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+
+    ChatRequest:
+      type: object
+      description: |
+        The canonical chat-completion request. Unknown top-level fields are preserved and passed
+        through to the provider adapter rather than rejected, so a new provider feature does not
+        require a gateway release to use.
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          description: |
+            The **logical** model name, never a provider deployment name. Resolved to a pool, then
+            to a backend. Required; an empty value is `400 invalid_request` naming `model`.
+          example: general-chat
+        messages:
+          type: array
+          minItems: 1
+          description: At least one message is required.
+          items:
+            $ref: '#/components/schemas/Message'
+        max_tokens:
+          type: [integer, 'null']
+          minimum: 1
+          description: |
+            Maximum output tokens. When omitted the gateway substitutes its configured default
+            before quota reservation, because a reservation needs a number either way. A value
+            above the logical model's `max_output_tokens` is `400 invalid_request`.
+        temperature:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 2
+          description: Outside `[0, 2]` is `400 invalid_request` naming `temperature`.
+        top_p:
+          type: [number, 'null']
+          exclusiveMinimum: 0
+          maximum: 1
+          description: Must be greater than 0 and at most 1, or `400 invalid_request`.
+        n:
+          type: [integer, 'null']
+        stop:
+          description: A stop string or an array of stop strings, forwarded verbatim.
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+            - type: 'null'
+        stream:
+          type: boolean
+          default: false
+          description: When true the response is `text/event-stream`.
+        stream_options:
+          oneOf:
+            - $ref: '#/components/schemas/StreamOptions'
+            - type: 'null'
+        presence_penalty:
+          type: [number, 'null']
+        frequency_penalty:
+          type: [number, 'null']
+        seed:
+          type: [integer, 'null']
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tool'
+        tool_choice:
+          description: '`"auto"`, `"none"`, `"required"`, or a specific tool object. Forwarded verbatim.'
+          oneOf:
+            - type: string
+            - type: object
+              additionalProperties: true
+            - type: 'null'
+        response_format:
+          description: 'For example `{"type": "json_object"}`. Forwarded verbatim.'
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: 'null'
+        user:
+          type: string
+          description: |
+            An end-user identifier for the provider's own abuse detection. When omitted the gateway
+            substitutes a stable, non-identifying per-agent value derived from the agent id, so a
+            provider gets a consistent signal without a person being exposed.
+        metadata:
+          oneOf:
+            - $ref: '#/components/schemas/Metadata'
+            - type: 'null'
+      additionalProperties: true
+
+    Usage:
+      type: object
+      description: Token accounting for one call.
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+        cached_tokens:
+          type: integer
+          description: |
+            The **provider's own** prompt-cache hit count, which is distinct from the gateway's
+            response cache and is billed at a different rate. Omitted when zero.
+      additionalProperties: false
+
+    Choice:
+      type: object
+      description: |
+        One completion alternative. A unary response carries `message`; a streaming chunk carries
+        `delta`. The two are never both present.
+      required: [index]
+      properties:
+        index:
+          type: integer
+        message:
+          oneOf:
+            - $ref: '#/components/schemas/Message'
+            - type: 'null'
+        delta:
+          oneOf:
+            - $ref: '#/components/schemas/Message'
+            - type: 'null'
+        finish_reason:
+          type: string
+          description: |
+            For example `stop`, `length`, `tool_calls` or `content_filter`. Empty or absent on
+            intermediate streaming chunks.
+      additionalProperties: false
+
+    ChatResponse:
+      type: object
+      description: |
+        The canonical chat-completion response. `model` is always the **logical** model the caller
+        asked for; the concrete backend model is in the `x-agentgate-model` header.
+      required: [id, object, created, model, choices]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          description: '`chat.completion`.'
+        created:
+          type: integer
+          format: int64
+          description: Unix seconds.
+        model:
+          type: string
+          description: The logical model name.
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/Choice'
+        usage:
+          oneOf:
+            - $ref: '#/components/schemas/Usage'
+            - type: 'null'
+        system_fingerprint:
+          type: string
+      additionalProperties: true
+
+    Chunk:
+      type: object
+      description: |
+        One streaming delta, carried in an unnamed `data:` frame. Structurally identical to
+        `ChatResponse` except that `object` is `chat.completion.chunk` and choices carry `delta`
+        rather than `message`.
+      required: [id, object, created, model, choices]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          description: '`chat.completion.chunk`.'
+        created:
+          type: integer
+          format: int64
+        model:
+          type: string
+          description: The logical model name.
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/Choice'
+        usage:
+          oneOf:
+            - $ref: '#/components/schemas/Usage'
+            - type: 'null'
+        system_fingerprint:
+          type: string
+      additionalProperties: true
+
+    StreamFailoverEvent:
+      type: object
+      description: |
+        Payload of the `agentgate.failover` named frame.
+
+        Emitted once, before any content frame, and only when the stream was opened on a different
+        backend than the one first tried. A stream is only ever failed over before the first
+        content byte, so this frame cannot appear after one — its presence is evidence that nothing
+        was replayed or discarded. A cache-replayed stream never carries it.
+      required: [request_id, trace_id, from, to, pool, attempts]
+      properties:
+        request_id:
+          type: string
+        trace_id:
+          type: string
+        from:
+          type: string
+          description: |
+            The backend the stream was moved away from, as `provider/model`. This is the backend
+            whose failure caused the failover.
+          example: bedrock/claude-haiku
+        to:
+          type: string
+          description: The backend that actually served the stream, as `provider/model`.
+          example: azure-openai/gpt-4o-mini
+        pool:
+          type: string
+          description: |
+            The pool both backends belong to. Failover moves within a priority tier first, then to
+            the next tier, but never outside the pool.
+          example: general-chat
+        attempts:
+          type: integer
+          minimum: 2
+          description: |
+            Backend attempts made, including the successful one. At least 2 whenever this frame is
+            present. Matches the `x-agentgate-attempts` response header.
+      additionalProperties: true
+
+    StreamUsageEvent:
+      type: object
+      description: |
+        Payload of the `agentgate.usage` named frame, emitted before `[DONE]` when
+        `stream_options.include_usage` is true. On a cache-replayed stream the `provider`,
+        `backend` and `attempts` fields are absent and `cache` and `savings_usd` are present
+        instead.
+      properties:
+        request_id:
+          type: string
+        trace_id:
+          type: string
+        provider:
+          type: string
+        backend:
+          type: string
+          description: The concrete backend name, for example `azure-openai/gpt-4o-mini`.
+        model:
+          type: string
+          description: The logical model name.
+        attempts:
+          type: integer
+        usage:
+          $ref: '#/components/schemas/Usage'
+        cost_usd:
+          type: number
+        estimated:
+          type: boolean
+          description: |
+            True when the provider did not report usage and the gateway counted the completion
+            itself. Chargeback reconciles estimated records separately; they are never charged as
+            if they had been measured.
+        stalls:
+          type: integer
+          description: |
+            Number of inter-token gaps that exceeded the configured stall threshold during this
+            stream. A non-zero value is the evidence behind a "the model went quiet" report.
+        cache:
+          type: string
+          description: Present on a cache-replayed stream.
+        savings_usd:
+          type: number
+          description: |
+            Present on a cache-replayed stream: what the call would have cost had it reached a
+            provider.
+      additionalProperties: true
+
+    EmbeddingsRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model:
+          type: string
+          description: The logical embedding model name.
+        input:
+          description: A single string, or an array of strings. An empty input is `400 invalid_request`.
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        dimensions:
+          type: [integer, 'null']
+        encoding_format:
+          type: string
+          description: For example `float` or `base64`. Forwarded to the provider.
+        user:
+          type: string
+      additionalProperties: false
+
+    Embedding:
+      type: object
+      required: [object, index, embedding]
+      properties:
+        object:
+          type: string
+          description: '`embedding`.'
+        index:
+          type: integer
+        embedding:
+          type: array
+          items:
+            type: number
+            format: double
+      additionalProperties: false
+
+    EmbeddingsResponse:
+      type: object
+      required: [object, data, model]
+      properties:
+        object:
+          type: string
+          description: '`list`.'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Embedding'
+        model:
+          type: string
+          description: The logical model name the caller asked for.
+        usage:
+          oneOf:
+            - $ref: '#/components/schemas/Usage'
+            - type: 'null'
+      additionalProperties: false
+
+    Model:
+      type: object
+      description: A logical model as advertised on `/v1/models`.
+      required: [id, object, created, owned_by]
+      properties:
+        id:
+          type: string
+          description: The logical model name.
+        object:
+          type: string
+          description: '`model`.'
+        created:
+          type: integer
+          format: int64
+          description: |
+            Present for OpenAI shape compatibility. AgentGate does not track a creation time for a
+            logical model and reports `0`.
+        owned_by:
+          type: string
+          description: Always `agentgate`. A logical model is owned by the platform, not a provider.
+        context_window:
+          type: integer
+          description: |
+            Total context in tokens. Omitted when the platform does not declare one, in which case
+            the context-window admission check is skipped for this model.
+        max_output_tokens:
+          type: integer
+          description: |
+            Maximum output tokens. A request whose effective `max_tokens` exceeds this is refused
+            with `400 invalid_request` before a provider is called.
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: |
+            Declared capabilities, for example `chat`, `tools`, `streaming`, `embeddings`. Derived
+            from the backing pool when the model does not declare its own.
+        pool:
+          type: string
+          description: The pool this model resolves to. Must appear in the token's `model_pools`.
+      additionalProperties: false
+
+    ModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object:
+          type: string
+          description: '`list`.'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Model'
+      additionalProperties: false
+
+    TokenCountResponse:
+      type: object
+      description: The `/v1/token-count` result.
+      required:
+        - model
+        - estimated_input_tokens
+        - context_window
+        - max_output_tokens
+        - estimated
+        - monthly_tokens_used
+        - monthly_token_budget
+        - tokens_per_minute_limit
+      properties:
+        model:
+          type: string
+          description: The logical model the estimate was taken against.
+        estimated_input_tokens:
+          type: integer
+        context_window:
+          type: integer
+        max_output_tokens:
+          type: integer
+        estimated:
+          type: boolean
+          description: Always `true`. The figure comes from the gateway's estimator, not a provider tokenizer.
+        monthly_tokens_used:
+          type: integer
+          format: int64
+        monthly_token_budget:
+          type: integer
+          format: int64
+        tokens_per_minute_limit:
+          type: integer
+          format: int64
+      additionalProperties: false
+
+    Problem:
+      type: object
+      description: |
+        An RFC 9457 problem details document, extended with the fields a caller needs in order to
+        open a support ticket that can actually be investigated. Returned with content type
+        `application/problem+json`.
+
+        `detail` never contains prompt content or a secret: it is returned to the caller and
+        written to logs.
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: '`https://agentgate.internal/errors/<code>`.'
+        title:
+          type: string
+          description: A short, stable, human-readable summary of the code.
+        status:
+          type: integer
+          description: The HTTP status. Always the frozen status for this `code`.
+        detail:
+          type: string
+          description: What went wrong on this specific call.
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        request_id:
+          type: string
+        trace_id:
+          type: string
+        retry_after_seconds:
+          type: integer
+          description: |
+            Present when a retry is worth attempting. Mirrors the `Retry-After` response header.
+        param:
+          type: string
+          description: |
+            The offending request field, on validation errors. For example `messages`,
+            `temperature`, `top_p`, `max_tokens`, `model` or `input`.
+      additionalProperties: true
+
+    ErrorCode:
+      type: string
+      description: |
+        The stable, machine-readable error identifier. A code never changes meaning and never
+        changes HTTP status. Branch on this, not on `title` or `detail`.
+      enum:
+        - invalid_request
+        - unauthenticated
+        - forbidden_pool
+        - agent_not_promoted
+        - guardrail_blocked
+        - unknown_model
+        - not_found
+        - client_timeout
+        - idempotency_conflict
+        - conflict
+        - promotion_gate_blocked
+        - context_too_large
+        - rate_limited
+        - quota_exceeded
+        - client_closed_request
+        - provider_error
+        - no_healthy_backend
+        - provider_timeout
+        - internal_error
+
+    Health:
+      type: object
+      required: [status, service, env, version, uptime_seconds]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        service:
+          type: string
+        env:
+          type: string
+          enum: [dev, staging, prod]
+        version:
+          $ref: '#/components/schemas/VersionInfo'
+        uptime_seconds:
+          type: integer
+      additionalProperties: false
+
+    VersionInfo:
+      type: object
+      description: Build identity, stamped in at link time.
+      required: [version, commit, build_date, go_version, platform]
+      properties:
+        version:
+          type: string
+          description: '`dev` when the binary was built without version stamping.'
+        commit:
+          type: string
+        build_date:
+          type: string
+        go_version:
+          type: string
+        platform:
+          type: string
+      additionalProperties: false
+
+    Readiness:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready, starting]
+        checks:
+          type: object
+          description: |
+            Present once the server has been marked ready. The `rate_limiter_degraded` key appears
+            only when the fallback limiter is in use.
+          properties:
+            backends_available:
+              type: integer
+              description: Backends across all pools whose circuit is closed and which are not drained.
+            rate_limiter:
+              type: boolean
+              description: Whether the rate limiter answered a health probe within 3 seconds.
+            rate_limiter_degraded:
+              type: boolean
+              description: Whether the limiter has fallen back to in-memory buckets.
+            concurrency_saturation:
+              type: number
+              description: In-flight requests as a fraction of the configured ceiling.
+            retry_ratio:
+              type: number
+              description: Retries as a fraction of request volume over the fleet retry window.
+          additionalProperties: true
+      additionalProperties: false
+
+    BreakerSnapshot:
+      type: object
+      description: A circuit breaker's current view.
+      required: [name, state, failure_rate, observed, consecutive_failures]
+      properties:
+        name:
+          type: string
+        state:
+          type: string
+          enum: [closed, open, half_open]
+        failure_rate:
+          type: number
+          description: Failure ratio over the breaker's sliding window.
+        observed:
+          type: integer
+          description: Requests in the sliding window.
+        consecutive_failures:
+          type: integer
+        opened_at:
+          type: string
+          description: When the breaker last opened. Absent while closed.
+      additionalProperties: false
+
+    BackendStatus:
+      type: object
+      description: One backend's routing state, as reported by the operator surface.
+      required: [name, provider, model, priority, weight, breaker, inflight, successes, failures, drained, max_classification]
+      properties:
+        name:
+          type: string
+        provider:
+          type: string
+        model:
+          type: string
+          description: The concrete provider model or deployment name.
+        priority:
+          type: integer
+          description: Lower is preferred. Failover moves to the next tier only when a tier is exhausted.
+        weight:
+          type: integer
+          description: Relative share within a priority tier.
+        breaker:
+          $ref: '#/components/schemas/BreakerSnapshot'
+        inflight:
+          type: integer
+          format: int64
+        successes:
+          type: integer
+          format: int64
+        failures:
+          type: integer
+          format: int64
+        drained:
+          type: boolean
+          description: Whether an operator has taken this backend out of rotation.
+        last_error:
+          type: string
+        max_classification:
+          type: string
+          enum: [public, internal, confidential, restricted]
+          description: The most sensitive data classification this backend may serve.
+        residency:
+          type: string
+          description: Data-residency label, for example `eu-west`.
+      additionalProperties: false
+
+  responses:
+
+    InvalidRequest:
+      description: |
+        `400 invalid_request` — the body was malformed, a parameter was out of range, or the
+        upstream provider rejected the request as invalid. **Do not retry**: the same request will
+        fail the same way. `param` names the offending field when one can be identified.
+      headers:
+        x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+        x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            temperature:
+              value:
+                type: https://agentgate.internal/errors/invalid_request
+                title: Invalid request
+                status: 400
+                detail: temperature must be between 0 and 2
+                code: invalid_request
+                param: temperature
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    Unauthenticated:
+      description: |
+        `401 unauthenticated` — the token was missing, expired, or could not be verified. The
+        detail is deliberately coarse; the precise reason is on the span and in the gateway's log
+        record. Obtain a fresh token and retry once.
+      headers:
+        x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+        x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            missing:
+              value:
+                type: https://agentgate.internal/errors/unauthenticated
+                title: Unauthenticated
+                status: 401
+                detail: 'an Authorization: Bearer token issued by the AgentGate control plane is required'
+                code: unauthenticated
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    Forbidden:
+      description: |
+        `403` — one of three codes, all of which are permanent for this token and must not be
+        retried with the same token:
+
+        * `forbidden_pool` — the pool is not in the token's `model_pools`, or the token lacks the
+          required scope (`models:invoke` for chat, `models:embed` for embeddings).
+        * `agent_not_promoted` — the token is scoped to a different environment than the gateway
+          serves. Promote the version, or point at the right gateway.
+        * `guardrail_blocked` — content safety denied the request or the response. Do not retry;
+          the same content will be blocked again.
+      headers:
+        x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+        x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+        x-agentgate-guardrail: {$ref: '#/components/headers/Guardrail'}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            forbiddenPool:
+              summary: forbidden_pool
+              value:
+                type: https://agentgate.internal/errors/forbidden_pool
+                title: Pool not permitted for this agent
+                status: 403
+                detail: 'agent://fsclient/payments-risk/dispute-triage is not entitled to pool "long-context"; entitled pools are general-chat'
+                code: forbidden_pool
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+            notPromoted:
+              summary: agent_not_promoted
+              value:
+                type: https://agentgate.internal/errors/agent_not_promoted
+                title: Agent version not promoted for this environment
+                status: 403
+                detail: this token is scoped to the staging environment and this gateway serves prod
+                code: agent_not_promoted
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+            guardrailBlocked:
+              summary: guardrail_blocked
+              value:
+                type: https://agentgate.internal/errors/guardrail_blocked
+                title: Blocked by content safety policy
+                status: 403
+                detail: the request was blocked by content safety policy (pii)
+                code: guardrail_blocked
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    UnknownModel:
+      description: |
+        `404 unknown_model` — the logical model does not exist for this tenant, or the caller is
+        not entitled to it. The two are indistinguishable by design. Call `GET /v1/models` to see
+        what this token may use.
+      headers:
+        x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+        x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            unknown:
+              value:
+                type: https://agentgate.internal/errors/unknown_model
+                title: Unknown model
+                status: 404
+                detail: unknown model "gpt-4o-mini"
+                code: unknown_model
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    NotFound:
+      description: |
+        `404 not_found` — the addressed object does not exist. On the operator surface this means
+        an unknown pool or backend name.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            unknownBackend:
+              value:
+                type: https://agentgate.internal/errors/not_found
+                title: Not found
+                status: 404
+                detail: unknown backend
+                code: not_found
+
+    ClientTimeout:
+      description: |
+        `408 client_timeout` — the caller's deadline was exceeded before the gateway could answer.
+        Retry with a longer deadline or a smaller request; retrying with the same deadline against
+        the same load will time out again.
+      headers:
+        x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+        x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            timeout:
+              value:
+                type: https://agentgate.internal/errors/client_timeout
+                title: Client deadline exceeded
+                status: 408
+                detail: the caller's deadline was exceeded
+                code: client_timeout
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    IdempotencyConflict:
+      description: |
+        `409 idempotency_conflict` — the idempotency key has already been used with a different
+        request body. Use a new key, or send the original body.
+      headers:
+        x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+        x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            conflict:
+              value:
+                type: https://agentgate.internal/errors/idempotency_conflict
+                title: Idempotency key conflict
+                status: 409
+                detail: idempotency key "4a4b6a90-2c48-4c04-9d63-1c9f4a1c9d1a" was already used with a different request body
+                code: idempotency_conflict
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    ContextTooLarge:
+      description: |
+        `413 context_too_large` — the estimated input plus the requested output exceeds the logical
+        model's context window, or the provider reported the same. Trim the context, lower
+        `max_tokens`, or move to a longer-context model. `POST /v1/token-count` answers this before
+        a request is spent.
+      headers:
+        x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+        x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            tooLarge:
+              value:
+                type: https://agentgate.internal/errors/context_too_large
+                title: Context window exceeded
+                status: 413
+                detail: estimated 126400 input tokens plus 4096 requested output tokens exceeds the 128000 token context window of general-chat
+                code: context_too_large
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    RateLimited:
+      description: |
+        `429` — one of two codes, both carrying `Retry-After`:
+
+        * `rate_limited` — the agent's requests-per-minute limit, the gateway shedding `batch`
+          traffic to protect interactive traffic, or the upstream provider throttling.
+        * `quota_exceeded` — the agent's tokens-per-minute limit or monthly token budget.
+
+        Wait for `Retry-After` seconds, then retry. Retrying sooner is what turns a limit into an
+        outage: the fleet-wide retry budget will shed the excess.
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+        x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+        x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+        x-agentgate-ratelimit-limit-tokens: {$ref: '#/components/headers/RateLimitLimit'}
+        x-agentgate-ratelimit-remaining-tokens: {$ref: '#/components/headers/RateLimitRemaining'}
+        x-agentgate-ratelimit-reset: {$ref: '#/components/headers/RateLimitReset'}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            quotaExceeded:
+              summary: quota_exceeded
+              value:
+                type: https://agentgate.internal/errors/quota_exceeded
+                title: Token quota exceeded
+                status: 429
+                detail: 'agent://fsclient/payments-risk/dispute-triage: tokens per minute exhausted'
+                code: quota_exceeded
+                retry_after_seconds: 17
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+            rateLimited:
+              summary: rate_limited
+              value:
+                type: https://agentgate.internal/errors/rate_limited
+                title: Rate limited
+                status: 429
+                detail: 'agent://fsclient/payments-risk/dispute-triage exceeded 600 requests per minute'
+                code: rate_limited
+                retry_after_seconds: 5
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+            shed:
+              summary: rate_limited, load shedding
+              value:
+                type: https://agentgate.internal/errors/rate_limited
+                title: Rate limited
+                status: 429
+                detail: the gateway is shedding batch traffic to protect interactive requests
+                code: rate_limited
+                retry_after_seconds: 2
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    InternalError:
+      description: |
+        `500 internal_error` — an unexpected fault in the gateway. The underlying error text is
+        deliberately not forwarded. Retry once with backoff; if it persists, quote
+        `x-agentgate-request-id`.
+      headers:
+        x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+        x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            internal:
+              value:
+                type: https://agentgate.internal/errors/internal_error
+                title: Internal error
+                status: 500
+                detail: the gateway encountered an unexpected error
+                code: internal_error
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    ProviderError:
+      description: |
+        `502 provider_error` — the upstream provider returned an unrecoverable error, or the
+        gateway could not authenticate to it. Retries and failover have already been exhausted.
+        `Retry-After` is present when the gateway has an estimate.
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+        x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+        x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+        x-agentgate-provider: {$ref: '#/components/headers/Provider'}
+        x-agentgate-attempts: {$ref: '#/components/headers/Attempts'}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            providerError:
+              value:
+                type: https://agentgate.internal/errors/provider_error
+                title: Upstream provider error
+                status: 502
+                detail: upstream provider is unavailable
+                code: provider_error
+                retry_after_seconds: 5
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    NoHealthyBackend:
+      description: |
+        `503 no_healthy_backend` — every backend in the pool is open-circuit, drained, or excluded
+        by the request's data classification. This is a platform failure and it burns the gateway's
+        availability error budget. Honour `Retry-After`; if it persists, the on-call runbook is
+        `docs/runbooks/no-healthy-backend.md`.
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+        x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+        x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+        x-agentgate-pool: {$ref: '#/components/headers/PoolUsed'}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            noBackend:
+              value:
+                type: https://agentgate.internal/errors/no_healthy_backend
+                title: No healthy backend
+                status: 503
+                detail: every backend in pool "general-chat" is unavailable
+                code: no_healthy_backend
+                retry_after_seconds: 5
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+
+    ProviderTimeout:
+      description: |
+        `504 provider_timeout` — the upstream provider did not respond within the deadline, after
+        retries. Retry with backoff, or with a smaller request.
+      headers:
+        x-agentgate-request-id: {$ref: '#/components/headers/RequestId'}
+        x-agentgate-trace-id: {$ref: '#/components/headers/TraceId'}
+        x-agentgate-provider: {$ref: '#/components/headers/Provider'}
+        x-agentgate-attempts: {$ref: '#/components/headers/Attempts'}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            providerTimeout:
+              value:
+                type: https://agentgate.internal/errors/provider_timeout
+                title: Upstream provider timeout
+                status: 504
+                detail: upstream provider did not respond within the deadline
+                code: provider_timeout
+                request_id: req_2f9c0a1d4b8e4c7f9a11
+                trace_id: 4bf92f3577b34da6a3ce929d0e0e4736

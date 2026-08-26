@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agentgate
+  labels:
+    app.kubernetes.io/name: agentgate
+    app.kubernetes.io/part-of: agentgate
+    # Pod Security Admission at `restricted`, enforced rather than audited.
+    # Every workload here runs non-root on a read-only root filesystem with all
+    # capabilities dropped, so enforcing costs nothing and prevents a future
+    # manifest from quietly relaxing it.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    # Selector target for NetworkPolicies in other namespaces that need to
+    # reach the gateway.
+    kubernetes.io/metadata.name: agentgate
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: agentgate-quota
+  namespace: agentgate
+spec:
+  hard:
+    requests.cpu: "64"
+    requests.memory: 128Gi
+    limits.memory: 256Gi
+    pods: "200"
+    services: "20"
+    # No LoadBalancer Services: everything is reached through the internal
+    # Gateway/Ingress. A LoadBalancer created here would be a public IP nobody
+    # reviewed (SPEC §8).
+    services.loadbalancers: "0"
+    persistentvolumeclaims: "4"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: agentgate-limits
+  namespace: agentgate
+spec:
+  limits:
+    - type: Container
+      # Defaults only apply to containers that specify nothing. Every workload
+      # in this directory sets its own values explicitly; this exists so a
+      # hand-applied debug pod cannot run unbounded.
+      default:
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: "8"
+        memory: 16Gi

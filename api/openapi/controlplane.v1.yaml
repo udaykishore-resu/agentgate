@@ -1,0 +1,1931 @@
+openapi: 3.1.0
+
+info:
+  title: AgentGate Control Plane API
+  version: "1.0.0"
+  summary: Agent registration, workload identity issuance, and the promotion gate.
+  description: |
+    The control plane is the trust plane: it owns the agent inventory, issues and rotates workload
+    identity, and runs the promotion gate that decides whether a version may serve traffic in an
+    environment.
+
+    It is deliberately **off the request path**. The gateway verifies tokens against a cached key
+    set and enforces on signed claims, so a control-plane outage stops new identities from being
+    issued but does not stop agents that are already running. That separation is the single most
+    important availability property of the platform, and it is the reason this API is documented
+    separately from `gateway.v1.yaml` rather than folded into it.
+
+    ## Two surfaces, two authentication models
+
+    * **The OAuth2 surface** — `/.well-known/*` and `/oauth2/token` — is standards-shaped so that
+      an enterprise identity provider or an API management layer can validate AgentGate tokens
+      without a bespoke integration. `/oauth2/token` is `application/x-www-form-urlencoded` and
+      returns OAuth2-style `{"error", "error_description"}` bodies, not problem+json.
+    * **The management surface** — `/api/v1/*` — is JSON and returns RFC 9457 problem+json. It is
+      authenticated with a bearer token and authorised by scope: `agents:register`,
+      `agents:promote`, `agents:approve`, `fleet:read`, `platform:admin`. A token carrying
+      `platform:admin` satisfies any scope check.
+
+      Management request bodies are decoded with unknown fields **rejected**. A typo in a CI
+      manifest fails loudly at registration rather than being silently dropped and discovered on
+      promotion day.
+
+    ## Compatibility
+
+    Same rule as the gateway: fields may be added, nothing is removed or retyped, no error `code`
+    changes status. A breaking change is a `/v2`.
+
+    ## Local development
+
+    When `allow_anonymous_admin` is set — local development only — the management surface skips
+    token verification and takes the audit actor from the `x-agentgate-actor` request header,
+    defaulting to `anonymous@localdev`. It is refused by config validation in staging and
+    production.
+
+    ## Prometheus scrape endpoint
+
+    `GET /metrics` is served on a separate operator listener, not by this API.
+  contact:
+    name: AI Platform team
+    email: ai-platform@client.example
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://controlplane.agentgate.internal
+    description: Production control plane
+  - url: https://controlplane.staging.agentgate.internal
+    description: Staging control plane
+  - url: http://localhost:8081
+    description: Local development stack (docker-compose)
+
+tags:
+  - name: discovery
+    description: OIDC discovery and key publication. Unauthenticated.
+  - name: token
+    description: Access token issuance. Two grants, both form-encoded.
+  - name: agents
+    description: Agent registration and inventory.
+  - name: credentials
+    description: Client credential issuance and rotation. The fallback for runtimes with no workload identity.
+  - name: promotions
+    description: The promotion gate, its evidence, and the two-party approval flow.
+  - name: operations
+    description: Liveness and readiness. Unauthenticated, network-restricted.
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  /.well-known/openid-configuration:
+    get:
+      tags: [discovery]
+      operationId: discovery
+      summary: OIDC discovery document
+      description: |
+        Published so that the gateway, an enterprise identity provider, or an API management layer
+        can locate the key set and the token endpoint without configuration. The `issuer` and the
+        URLs are derived from the request host, honouring `X-Forwarded-Proto` and
+        `X-Forwarded-Host`, so the document is correct behind a front door.
+      security: []
+      responses:
+        '200':
+          description: The discovery document.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiscoveryDocument'
+              examples:
+                discovery:
+                  value:
+                    issuer: https://controlplane.agentgate.internal
+                    jwks_uri: https://controlplane.agentgate.internal/.well-known/jwks.json
+                    token_endpoint: https://controlplane.agentgate.internal/oauth2/token
+                    grant_types_supported:
+                      - client_credentials
+                      - urn:ietf:params:oauth:grant-type:token-exchange
+                    token_endpoint_auth_methods_supported: [client_secret_post, none]
+                    id_token_signing_alg_values_supported: [RS256]
+                    scopes_supported:
+                      - models:invoke
+                      - models:embed
+                      - agents:register
+                      - agents:promote
+                      - agents:approve
+                      - fleet:read
+
+  /.well-known/jwks.json:
+    get:
+      tags: [discovery]
+      operationId: jwks
+      summary: JSON Web Key Set
+      description: |
+        The public half of every signing key the control plane will accept a signature from,
+        including keys that are no longer active for signing but whose tokens are still valid.
+
+        Served with `Cache-Control: public, max-age=300`. Five minutes is deliberate: long enough
+        that the gateway does not hammer the endpoint, short enough that a key rotation propagates
+        in minutes rather than hours.
+      security: []
+      responses:
+        '200':
+          description: The key set.
+          headers:
+            Cache-Control:
+              description: Always `public, max-age=300`.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JWKSet'
+              examples:
+                keys:
+                  value:
+                    keys:
+                      - kty: RSA
+                        kid: k-2026-08
+                        use: sig
+                        alg: RS256
+                        n: sXchqp8h1cE0-ZgmVvJ0f2QXG9d1LrY7bE4nJ0kTv1M
+                        e: AQAB
+
+  /oauth2/token:
+    post:
+      tags: [token]
+      operationId: issueToken
+      summary: Issue an AgentGate access token
+      description: |
+        Two grants are supported. Both are `application/x-www-form-urlencoded`.
+
+        ### `urn:ietf:params:oauth:grant-type:token-exchange` (preferred)
+
+        RFC 8693. The agent's runtime has already proved who it is — a Kubernetes projected service
+        account token, an Azure managed identity token, an IAM Roles Anywhere or SPIFFE JWT-SVID —
+        and the control plane converts that proof into an AgentGate identity. **No shared secret
+        ever exists.**
+
+        The subject token's issuer must be one of the configured trusted issuers, its signature
+        must verify, and its subject must correspond to the agent being requested. Correspondence
+        is checked against the agent's `workload_subject` label when one is recorded, and otherwise
+        by requiring the agent name to appear in the workload subject. Without this check any
+        workload in the cluster could obtain any agent's identity.
+
+        Tokens from this grant carry `attestation=workload-identity`, which is what the production
+        promotion gate requires.
+
+        ### `client_credentials` (fallback)
+
+        For runtimes that cannot do federated workload identity. Credentials may be sent as
+        `client_id`/`client_secret` form fields or as HTTP Basic authentication. An unknown client
+        and a wrong secret produce the same `invalid_client` response: distinguishing them is an
+        enumeration oracle.
+
+        Tokens from this grant carry `attestation=client-secret`, which the production promotion
+        gate refuses.
+
+        ### Version selection
+
+        `agent_version` selects a specific version. When omitted, the version currently `active` in
+        the requested `env` is used. If no version is active there, the request is refused with
+        `403 invalid_grant` — a version that has not been promoted cannot obtain an identity for
+        that environment, which is what makes the promotion gate load-bearing rather than advisory.
+
+        Responses carry `Cache-Control: no-store`: a token is a credential and must never be held
+        by an intermediary.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TokenRequestForm'
+            examples:
+              tokenExchange:
+                summary: Token exchange from a Kubernetes projected service account token
+                value:
+                  grant_type: urn:ietf:params:oauth:grant-type:token-exchange
+                  subject_token: eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0.eyJpc3MiOiJodHRwczovL2t1YmVybmV0ZXMuZGVmYXVsdC5zdmMifQ.sig
+                  subject_token_type: urn:ietf:params:oauth:token-type:jwt
+                  agent_identity: agent://fsclient/payments-risk/dispute-triage
+                  env: prod
+                  agent_version: 2.4.1
+              clientCredentials:
+                summary: Client credentials
+                value:
+                  grant_type: client_credentials
+                  client_id: cli_01j8z9x2qk4m7p3r5t9v
+                  client_secret: ags_Q2xpZW50U2VjcmV0RXhhbXBsZVZhbHVl
+                  env: staging
+      responses:
+        '200':
+          description: An access token.
+          headers:
+            Cache-Control:
+              description: Always `no-store`.
+              schema:
+                type: string
+            Pragma:
+              description: Always `no-cache`.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+              examples:
+                issued:
+                  value:
+                    access_token: eyJhbGciOiJSUzI1NiIsImtpZCI6ImstMjAyNi0wOCJ9.eyJzdWIiOiJhZ2VudDovLyJ9.sig
+                    token_type: Bearer
+                    expires_in: 900
+                    scope: models:invoke models:embed
+                    issued_at: 1774526521
+                    agent_id: agt_01j8z9x2qk4m7p3r5t9v
+                    env: prod
+                    agent_version: 2.4.1
+        '400':
+          description: |
+            `invalid_request` — a required form field is missing or the body could not be parsed.
+            `invalid_grant` — the subject token could not be verified, or the agent is not
+            registered. `unsupported_grant_type` — `grant_type` is neither supported grant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+              examples:
+                missingFields:
+                  value:
+                    error: invalid_request
+                    error_description: subject_token and agent_identity are required
+                unsupportedGrant:
+                  value:
+                    error: unsupported_grant_type
+                    error_description: supported grants are client_credentials and urn:ietf:params:oauth:grant-type:token-exchange
+        '401':
+          description: '`invalid_client` — client authentication failed.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+              examples:
+                badClient:
+                  value:
+                    error: invalid_client
+                    error_description: client authentication failed
+        '403':
+          description: |
+            `invalid_grant` — the subject token does not correspond to the requested agent, or no
+            version of the agent is promoted for the requested environment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+              examples:
+                notPromoted:
+                  value:
+                    error: invalid_grant
+                    error_description: no active version of this agent is promoted for prod
+                subjectMismatch:
+                  value:
+                    error: invalid_grant
+                    error_description: the subject token does not correspond to this agent
+        '500':
+          description: '`server_error` — token minting failed for a reason that is not the caller''s.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthError'
+
+  /api/v1/agents:
+    post:
+      tags: [agents]
+      operationId: registerAgent
+      summary: Register an agent version
+      description: |
+        Called by CI on every deployment. **Idempotent on (identity, env, version)**: re-running a
+        pipeline does not create a second agent or a second credential.
+
+        A version registered into `dev` becomes `active` immediately — an engineer must be able to
+        run their agent against the gateway the same day they write it, or they will build
+        something that bypasses it. A version registered into `staging` or `prod` becomes
+        `registered` and must be promoted.
+
+        Ownership is mutable through this endpoint **except** the owning team: changing
+        `owner.team` is refused with `409 conflict`, because chargeback history would otherwise
+        move silently between cost centres. That transfer is a platform action.
+
+        `warnings` reports problems that do not block registration but will block promotion, so a
+        team learns about them one deployment early rather than on the day they try to ship.
+
+        Requires the `agents:register` scope. Unknown JSON fields are rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistrationRequest'
+            examples:
+              federated:
+                summary: Registration with federated workload identity (no secret)
+                value:
+                  identity: agent://fsclient/payments-risk/dispute-triage
+                  display_name: Dispute Triage Agent
+                  description: Classifies inbound card disputes and routes them to the right queue.
+                  owner:
+                    team: payments-risk
+                    email: payments-risk@client.example
+                    oncall: PD-PAYRISK
+                    cost_center: CC-4471
+                    manager: a.okafor@client.example
+                  runtime: aks
+                  framework: langgraph
+                  data_classification: confidential
+                  requested_pools: [general-chat, long-context]
+                  quota:
+                    tokens_per_minute: 120000
+                    requests_per_minute: 600
+                    monthly_token_budget: 900000000
+                    max_concurrent: 40
+                  version: 2.4.1
+                  env: staging
+                  image: registry.client.example/payments-risk/dispute-triage:2.4.1
+                  commit_sha: 9f21c4ade1b8f0c3d5a7e2419b6c8d0f3a1e5b7c
+                  security_review_ref: CHG0048221
+                  labels:
+                    workload_subject: system:serviceaccount:payments-risk:dispute-triage
+              withCredential:
+                summary: Registration asking for a client secret (discouraged)
+                value:
+                  identity: agent://fsclient/payments-risk/dispute-triage
+                  display_name: Dispute Triage Agent
+                  owner:
+                    team: payments-risk
+                    email: payments-risk@client.example
+                    oncall: PD-PAYRISK
+                    cost_center: CC-4471
+                  runtime: vm
+                  data_classification: internal
+                  requested_pools: [general-chat]
+                  quota:
+                    tokens_per_minute: 20000
+                    requests_per_minute: 60
+                    monthly_token_budget: 50000000
+                  version: 0.9.0
+                  env: dev
+                  issue_credential: true
+      responses:
+        '200':
+          description: |
+            The agent record after registration. `client_secret` is present only when
+            `issue_credential` was true; it is shown **once** and never stored in a form that can
+            be read back. The response then carries `Cache-Control: no-store`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistrationResult'
+              examples:
+                registered:
+                  value:
+                    agent:
+                      agent_id: agt_01j8z9x2qk4m7p3r5t
+                      identity: agent://fsclient/payments-risk/dispute-triage
+                      display_name: Dispute Triage Agent
+                      owner:
+                        team: payments-risk
+                        email: payments-risk@client.example
+                        oncall: PD-PAYRISK
+                        cost_center: CC-4471
+                      runtime: aks
+                      framework: langgraph
+                      data_classification: confidential
+                      requested_pools: [general-chat, long-context]
+                      granted_pools: [general-chat]
+                      quota:
+                        tokens_per_minute: 120000
+                        requests_per_minute: 600
+                        monthly_token_budget: 900000000
+                      versions:
+                        - version: 2.4.1
+                          env: staging
+                          state: registered
+                          image: registry.client.example/payments-risk/dispute-triage:2.4.1
+                          commit_sha: 9f21c4ade1b8f0c3d5a7e2419b6c8d0f3a1e5b7c
+                          registered_at: "2026-08-26T09:14:02Z"
+                          registered_by: ci@client.example
+                      security_review_ref: CHG0048221
+                      created_at: "2026-05-02T11:00:00Z"
+                      updated_at: "2026-08-26T09:14:02Z"
+                    version: 2.4.1
+                    env: staging
+                    state: registered
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+
+    get:
+      tags: [agents]
+      operationId: listAgents
+      summary: List registered agents
+      description: |
+        Requires the `fleet:read` scope. `tenant` and `team` are applied in the query; `env` and
+        `q` are applied in the application, so the same semantics hold for every store backend and
+        so a filter change does not need a database migration.
+      parameters:
+        - name: tenant
+          in: query
+          schema: {type: string}
+          example: fsclient
+        - name: team
+          in: query
+          schema: {type: string}
+          example: payments-risk
+        - name: env
+          in: query
+          description: Return agents that have at least one version in this environment.
+          schema:
+            type: string
+            enum: [dev, staging, prod]
+        - name: q
+          in: query
+          description: Case-insensitive substring match over identity and display name.
+          schema: {type: string}
+      responses:
+        '200':
+          description: Matching agents, ordered by identity.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [agents, count]
+                properties:
+                  agents:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Agent'
+                  count:
+                    type: integer
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+
+  /api/v1/agents/{id}:
+    get:
+      tags: [agents]
+      operationId: getAgent
+      summary: Show one agent
+      description: Requires the `fleet:read` scope. `id` is the `agent_id`, not the identity URI.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      responses:
+        '200':
+          description: The agent record, including every version and its last gate snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/agents/{id}/credentials:
+    post:
+      tags: [credentials]
+      operationId: issueCredential
+      summary: Issue a client secret
+      description: |
+        Mints a client credential for an agent. Only the SHA-256 hash of the secret is stored in
+        the registry; the secret itself goes to the enterprise vault, and the plaintext is returned
+        **once**.
+
+        Prefer token exchange with federated workload identity. Issuing a secret is logged at WARN,
+        and the resulting attestation is one the production promotion gate refuses.
+
+        Requires the `agents:register` scope. The request has no body.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      responses:
+        '201':
+          description: The credential. The secret is shown once.
+          headers:
+            Cache-Control:
+              description: Always `no-store`.
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuedCredential'
+              examples:
+                issued:
+                  value:
+                    client_id: cli_01j8z9x2qk4m7p3r5t9v
+                    client_secret: ags_Q2xpZW50U2VjcmV0RXhhbXBsZVZhbHVl
+                    expires_at: "2026-11-24T09:14:02Z"
+                    warning: this secret is shown once; prefer token exchange with federated workload identity
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/agents/{id}/credentials/{clientID}/rotate:
+    post:
+      tags: [credentials]
+      operationId: rotateCredential
+      summary: Rotate a client secret with an overlap window
+      description: |
+        Issues a new secret while leaving the previous one valid for the overlap window, so a
+        running agent picks up the new secret on its next restart rather than at the instant of
+        rotation. A rotation with no overlap is an outage scheduled for whenever the agent next
+        needs a token.
+
+        Requires the `agents:register` scope. The request has no body. Refused with `409 conflict`
+        when the credential does not belong to the named agent.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+        - name: clientID
+          in: path
+          required: true
+          description: The client id being rotated.
+          schema: {type: string}
+          example: cli_01j8z9x2qk4m7p3r5t9v
+        - name: overlap
+          in: query
+          required: false
+          description: |
+            How long the previous secret stays valid, as a Go duration (`24h`, `72h`, `30m`).
+            Defaults to `24h`. An unparseable value falls back to the default rather than failing.
+          schema:
+            type: string
+            default: 24h
+          example: 72h
+      responses:
+        '201':
+          description: The new credential, and when the previous one stops working.
+          headers:
+            Cache-Control:
+              description: Always `no-store`.
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotatedCredential'
+              examples:
+                rotated:
+                  value:
+                    client_id: cli_02k9a0y3rl5n8q4s6u
+                    client_secret: ags_Um90YXRlZFNlY3JldEV4YW1wbGVWYWx1ZQ
+                    previous_valid_until: "2026-08-29T09:14:02Z"
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+
+  /api/v1/agents/{id}/quarantine:
+    post:
+      tags: [agents]
+      operationId: quarantineVersion
+      summary: Forcibly disable an agent version
+      description: |
+        The platform's emergency stop for a runaway agent. The version's state becomes
+        `quarantined` and no further token will be minted for it. It takes effect at the agent's
+        next token refresh, which is why token lifetimes are short.
+
+        `reason` is required: a quarantine without a recorded reason cannot be reviewed afterwards.
+        The reason, the actor and the timestamp are written into the version's `notes`.
+
+        Requires the `platform:admin` scope.
+      parameters:
+        - $ref: '#/components/parameters/AgentId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuarantineRequest'
+            examples:
+              runaway:
+                value:
+                  version: 2.4.1
+                  env: prod
+                  reason: unbounded tool loop consuming 40x its declared quota; INC0091422
+      responses:
+        '200':
+          description: The version is quarantined.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [quarantined, actor]
+                properties:
+                  quarantined:
+                    type: boolean
+                  actor:
+                    type: string
+                    description: The principal recorded in the audit trail.
+              examples:
+                done:
+                  value:
+                    quarantined: true
+                    actor: s.mensah@client.example
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/promotions:
+    post:
+      tags: [promotions]
+      operationId: requestPromotion
+      summary: Evaluate the gate and open a promotion request
+      description: |
+        Evaluates every automated gate for a promotion from the version's source environment
+        (`dev` for a `staging` target, `staging` for a `prod` target) and opens a promotion
+        request carrying the evaluation snapshot verbatim.
+
+        **All gates run even after one fails.** An engineer given one blocker at a time makes one
+        fix at a time, and each round trip costs a deployment cycle.
+
+        The gate snapshot is recorded against the version whether or not it passed: a blocked
+        promotion is exactly the evidence an engineer needs.
+
+        Outcomes:
+
+        * Gate passed, target needs no approvals (`staging`) — the promotion is **applied
+          immediately** and the response state is `applied`.
+        * Gate passed, target is `prod` — state `pending`, a change record is submitted or printed
+          for manual filing, and two approvals are required.
+        * Gate failed — state `blocked`, returned with HTTP **409** and the
+          `promotion_gate_blocked` envelope described on that response. This is a normal, expected
+          outcome with a body the caller can act on, not a server error.
+
+        In the two cases that do not apply immediately — gate passed but approval outstanding, and
+        gate failed — a version record is created or updated in the **target** environment, with
+        state `pending_promotion` or `blocked` respectively and the evaluation attached as
+        `last_gate`. The fleet view therefore shows an agent waiting for approval or blocked by a
+        gate, rather than showing nothing at all until someone chases the promotion by hand.
+
+        Requires the `agents:promote` scope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromotionCreateRequest'
+            examples:
+              toProd:
+                value:
+                  agent_id: agt_01j8z9x2qk4m7p3r5t
+                  version: 2.4.1
+                  to: prod
+      responses:
+        '201':
+          description: The promotion request. State is `pending` or `applied`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromotionRequest'
+              examples:
+                pending:
+                  value:
+                    id: prm_1f0c8b3a-7d21-4e55-9a6b-0c2e8f4d1a93
+                    agent_id: agt_01j8z9x2qk4m7p3r5t
+                    identity: agent://fsclient/payments-risk/dispute-triage
+                    version: 2.4.1
+                    from: staging
+                    to: prod
+                    requested_by: r.iqbal@client.example
+                    requested_at: "2026-08-26T09:20:11Z"
+                    expires_at: "2026-08-29T09:20:11Z"
+                    gate:
+                      agent_id: agt_01j8z9x2qk4m7p3r5t
+                      version: 2.4.1
+                      from: staging
+                      to: prod
+                      passed: true
+                      evaluated_at: "2026-08-26T09:20:11Z"
+                      evaluator: agentgate-controlplane
+                      checks:
+                        - name: registration_complete
+                          status: pass
+                          detail: 'owner, on-call, cost centre and data classification must be present; missing: []'
+                          observed: 0 missing
+                          required: 0 missing
+                        - name: identity_attested
+                          status: pass
+                          detail: the agent must have authenticated with federated workload identity in the source environment
+                          observed: workload-identity
+                          required: workload-identity
+                        - name: telemetry_healthy
+                          status: pass
+                          detail: traces must be complete and correctly attributed over the last 24 hours
+                          observed: 0.994 completeness over 41220 requests
+                          required: '>= 0.95 completeness over >= 100 requests'
+                        - name: error_budget
+                          status: pass
+                          detail: the agent's own success rate must meet its objective in the source environment
+                          observed: "0.9987"
+                          required: '>= 0.9900'
+                        - name: guardrail_clean
+                          status: pass
+                          detail: no unresolved critical guardrail violations in the last 7 days
+                          observed: "0"
+                          required: <= 0
+                        - name: quota_declared
+                          status: pass
+                          detail: requested tokens per minute must fit inside the team's allocated envelope
+                          observed: 120000 tpm
+                          required: <= 400000 tpm
+                        - name: cost_projection
+                          status: pass
+                          detail: projected monthly spend must fit inside the team's budget
+                          observed: $1841.22 projected
+                          required: <= $6000.00
+                        - name: security_review
+                          status: pass
+                          detail: production requires a linked, unexpired security review reference
+                          observed: CHG0048221
+                          required: a valid CHG or RITM reference
+                    approvals: []
+                    state: pending
+                    change_ref: CHG0048999
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: |
+            The gate refused.
+
+            The body is a purpose-built envelope, **not** an RFC 9457 problem document. It carries
+            both halves of what the caller needs: the stable `promotion_gate_blocked` code, so a
+            pipeline can branch on it without parsing prose, and the complete `PromotionRequest`
+            including the verbatim gate evaluation, so an engineer can see exactly what to fix.
+            `failed_gates` is the shortcut — the names of the checks whose status is `fail` —
+            for a caller that only needs to print a reason and exit non-zero.
+
+            A problem document was rejected for this response deliberately: RFC 9457 has no place
+            to put structured evidence, and the evidence is the entire value of a refusal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromotionGateBlocked'
+              examples:
+                blocked:
+                  value:
+                    code: promotion_gate_blocked
+                    title: Promotion gate blocked
+                    detail: the automated gate did not pass; see failed_gates and promotion.gate.checks
+                    failed_gates: [telemetry_healthy]
+                    promotion:
+                      id: prm_4c1e9a02-33bd-4f8e-8f14-6a0d7b2c5e11
+                      agent_id: agt_01j8z9x2qk4m7p3r5t
+                      identity: agent://fsclient/payments-risk/dispute-triage
+                      version: 2.5.0
+                      from: staging
+                      to: prod
+                      requested_by: r.iqbal@client.example
+                      requested_at: "2026-08-26T10:02:00Z"
+                      expires_at: "2026-08-29T10:02:00Z"
+                      gate:
+                        agent_id: agt_01j8z9x2qk4m7p3r5t
+                        version: 2.5.0
+                        from: staging
+                        to: prod
+                        passed: false
+                        evaluated_at: "2026-08-26T10:02:00Z"
+                        evaluator: agentgate-controlplane
+                        checks:
+                          - name: telemetry_healthy
+                            status: fail
+                            detail: traces must be complete and correctly attributed over the last 24 hours
+                            observed: 0.812 completeness over 4120 requests
+                            required: '>= 0.95 completeness over >= 100 requests'
+                          - name: security_review
+                            status: waived
+                            detail: 'waived: review scheduled for 2026-09-02, CHG0049110 raised'
+                            observed: none
+                            required: a valid CHG or RITM reference
+                            waiver_id: wvr_8b1d2c4e-19a7-4b03-9f2e-77c0a3d5e912
+                      approvals: []
+                      state: blocked
+
+    get:
+      tags: [promotions]
+      operationId: listPromotions
+      summary: List promotion requests
+      description: |
+        Newest first, capped at 500. Requires the `fleet:read` scope.
+      parameters:
+        - name: agent_id
+          in: query
+          schema: {type: string}
+        - name: state
+          in: query
+          schema:
+            $ref: '#/components/schemas/PromotionState'
+      responses:
+        '200':
+          description: Matching promotion requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [promotions, count]
+                properties:
+                  promotions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PromotionRequest'
+                  count:
+                    type: integer
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+
+  /api/v1/promotions/{id}:
+    get:
+      tags: [promotions]
+      operationId: getPromotion
+      summary: Show one promotion request
+      description: |
+        The auditable record: who asked, when, what the gate observed, who approved, and when it
+        was applied. Requires the `fleet:read` scope.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+          example: prm_1f0c8b3a-7d21-4e55-9a6b-0c2e8f4d1a93
+      responses:
+        '200':
+          description: The promotion request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromotionRequest'
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/promotions/{id}/approve:
+    post:
+      tags: [promotions]
+      operationId: approvePromotion
+      summary: Record an approval or a rejection
+      description: |
+        Records one human decision against a pending promotion and enforces the two-party rule.
+
+        Production requires **two** approvals: one `owning_team` and one `platform`, from different
+        people, neither of whom is the requester. When both are recorded the promotion is applied
+        in the same call — the version becomes `active` in the target environment and whatever was
+        active there is `retired` rather than deleted, which is what makes an emergency rollback a
+        state change instead of a redeploy.
+
+        A rejection (`approved: false`) moves the promotion straight to `rejected`.
+
+        Requires the `agents:approve` scope.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApprovalRequest'
+            examples:
+              approve:
+                value:
+                  role: platform
+                  approved: true
+                  comment: Gate evidence reviewed; telemetry completeness 0.994 over 41220 requests.
+              reject:
+                value:
+                  role: owning_team
+                  approved: false
+                  comment: Holding until the tool-loop fix in 2.4.2 is in staging.
+      responses:
+        '200':
+          description: The promotion request after the decision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromotionRequest'
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: |
+            The two-party rules produce outcomes that are decisions, not faults, so the caller gets
+            the promotion record alongside the reason. Reasons are: the requester may not approve
+            their own promotion; this actor has already recorded a decision; this approver role is
+            already satisfied; the request is not pending; the request has expired.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, promotion]
+                properties:
+                  error:
+                    type: string
+                    description: Why the decision could not be recorded.
+                  promotion:
+                    $ref: '#/components/schemas/PromotionRequest'
+              examples:
+                selfApproval:
+                  value:
+                    error: the requester may not approve their own promotion
+                    promotion:
+                      id: prm_1f0c8b3a-7d21-4e55-9a6b-0c2e8f4d1a93
+                      state: pending
+
+  /api/v1/waivers:
+    post:
+      tags: [promotions]
+      operationId: grantWaiver
+      summary: Grant a time-boxed gate exception
+      description: |
+        Records an accepted exception to one automated gate for one agent. A gate that would fail
+        is reported as `waived` rather than `pass`, carrying the waiver id and reason, so the
+        exception is visible in the evidence rather than hidden by it.
+
+        `days` is clamped to `(0, 90]`; anything outside that becomes 30. **An exception without an
+        expiry is a policy change made quietly.**
+
+        Requires the `platform:admin` scope. Granting a waiver is logged at WARN.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WaiverRequest'
+            examples:
+              securityReview:
+                value:
+                  agent_id: agt_01j8z9x2qk4m7p3r5t
+                  gate: security_review
+                  reason: review scheduled for 2026-09-02, CHG0049110 raised
+                  days: 14
+      responses:
+        '201':
+          description: The waiver.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Waiver'
+              examples:
+                granted:
+                  value:
+                    id: wvr_8b1d2c4e-19a7-4b03-9f2e-77c0a3d5e912
+                    agent_id: agt_01j8z9x2qk4m7p3r5t
+                    gate: security_review
+                    reason: review scheduled for 2026-09-02, CHG0049110 raised
+                    granted_by: s.mensah@client.example
+                    granted_at: "2026-08-26T10:05:00Z"
+                    expires_at: "2026-09-09T10:05:00Z"
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+
+  /healthz:
+    get:
+      tags: [operations]
+      operationId: cpLiveness
+      summary: Liveness probe
+      description: Reports that the process is running. Depends on nothing downstream.
+      security: []
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, version]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  version:
+                    $ref: '#/components/schemas/VersionInfo'
+
+  /readyz:
+    get:
+      tags: [operations]
+      operationId: cpReadiness
+      summary: Readiness probe
+      description: |
+        Ready when the registry answers a list query and a signing key is active. Without a signing
+        key the control plane can serve reads but cannot issue an identity, which is not ready.
+      security: []
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CPReadiness'
+              examples:
+                ready:
+                  value:
+                    status: ready
+                    checks:
+                      registry: true
+                      signing_key: true
+        '503':
+          description: Not ready — the registry is unreachable, or no signing key is active.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CPReadiness'
+              examples:
+                notReady:
+                  value:
+                    status: not_ready
+                    checks:
+                      registry: false
+                      signing_key: true
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        A bearer token identifying a human or a CI principal, verified by the control plane's admin
+        verifier and authorised by scope. Registration is called by CI, promotion by an engineer or
+        a pipeline, and approval by a human; all three authenticate the same way and are
+        distinguished by scope, so the audit record always names a principal rather than "the
+        system". The audit actor is the token's `owner_email` claim when present, otherwise its
+        subject.
+
+  parameters:
+    AgentId:
+      name: id
+      in: path
+      required: true
+      description: The `agent_id`, for example `agt_01j8z9x2qk4m7p3r5t`. Not the identity URI.
+      schema: {type: string}
+      example: agt_01j8z9x2qk4m7p3r5t
+
+  schemas:
+
+    DiscoveryDocument:
+      type: object
+      required:
+        - issuer
+        - jwks_uri
+        - token_endpoint
+        - grant_types_supported
+        - token_endpoint_auth_methods_supported
+        - id_token_signing_alg_values_supported
+        - scopes_supported
+      properties:
+        issuer:
+          type: string
+          format: uri
+        jwks_uri:
+          type: string
+          format: uri
+        token_endpoint:
+          type: string
+          format: uri
+        grant_types_supported:
+          type: array
+          items: {type: string}
+        token_endpoint_auth_methods_supported:
+          type: array
+          items: {type: string}
+        id_token_signing_alg_values_supported:
+          type: array
+          items: {type: string}
+        scopes_supported:
+          type: array
+          items: {type: string}
+      additionalProperties: true
+
+    JWK:
+      type: object
+      description: One RSA public key.
+      required: [kty, kid, use, alg, n, e]
+      properties:
+        kty: {type: string, description: 'Always `RSA`.'}
+        kid: {type: string}
+        use: {type: string, description: 'Always `sig`.'}
+        alg: {type: string, description: 'Always `RS256`.'}
+        n: {type: string, description: Base64url modulus, unpadded.}
+        e: {type: string, description: Base64url exponent, unpadded.}
+      additionalProperties: false
+
+    JWKSet:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/JWK'
+      additionalProperties: false
+
+    TokenRequestForm:
+      type: object
+      description: |
+        The form fields the token endpoint reads. Which fields are required depends on
+        `grant_type`; fields belonging to the other grant are ignored.
+      required: [grant_type]
+      properties:
+        grant_type:
+          type: string
+          enum:
+            - client_credentials
+            - urn:ietf:params:oauth:grant-type:token-exchange
+        env:
+          type: string
+          enum: [dev, staging, prod]
+          default: dev
+          description: The environment the token is scoped to. Defaults to `dev` when omitted.
+        agent_version:
+          type: string
+          description: |
+            A specific version. When omitted, the version currently `active` in `env` is used.
+        subject_token:
+          type: string
+          description: |
+            Token exchange only, required. The platform-issued workload identity token. Its `iss`
+            claim selects which trusted verifier is used; nothing is trusted on the basis of it.
+        subject_token_type:
+          type: string
+          description: |
+            Token exchange only. Accepted and recorded for RFC 8693 conformance; the control plane
+            does not branch on it, because every trusted subject issuer produces a JWT.
+          example: urn:ietf:params:oauth:token-type:jwt
+        agent_identity:
+          type: string
+          description: |
+            Token exchange only, required. The `agent://tenant/team/name` URI the workload is
+            claiming.
+        client_id:
+          type: string
+          description: |
+            Client credentials only. May instead be sent as the username of HTTP Basic
+            authentication.
+        client_secret:
+          type: string
+          description: |
+            Client credentials only. May instead be sent as the password of HTTP Basic
+            authentication.
+      additionalProperties: false
+
+    TokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in, scope, issued_at, agent_id, env, agent_version]
+      properties:
+        access_token:
+          type: string
+          description: 'An RS256-signed JWT. Present it to the gateway as `Authorization: Bearer`.'
+        token_type:
+          type: string
+          description: Always `Bearer`.
+        expires_in:
+          type: integer
+          description: |
+            Seconds until expiry. Deliberately short (15 minutes by default) so that a quarantine
+            takes effect quickly.
+        scope:
+          type: string
+          description: Space-separated granted scopes, for example `models:invoke models:embed`.
+        issued_at:
+          type: integer
+          format: int64
+          description: Unix seconds.
+        agent_id:
+          type: string
+        env:
+          type: string
+          enum: [dev, staging, prod]
+        agent_version:
+          type: string
+      additionalProperties: false
+
+    OAuthError:
+      type: object
+      description: |
+        The OAuth2-shaped error body returned by `/oauth2/token`. Note that this endpoint does
+        **not** return problem+json: it returns what an OAuth2 client library expects.
+      required: [error, error_description]
+      properties:
+        error:
+          type: string
+          enum:
+            - invalid_request
+            - invalid_client
+            - invalid_grant
+            - unsupported_grant_type
+            - server_error
+        error_description:
+          type: string
+      additionalProperties: false
+
+    Owner:
+      type: object
+      description: |
+        The accountable team. Every field except `manager` is required before an agent can be
+        promoted: an agent whose owner cannot be paged is an agent that will page the platform team
+        instead.
+      required: [team, email, oncall, cost_center]
+      properties:
+        team:
+          type: string
+          description: |
+            Must equal the team segment of the identity URI. A mismatch is refused at registration.
+        email:
+          type: string
+          description: A team distribution list, not an individual.
+        oncall:
+          type: string
+          description: The paging rotation identifier, for example a PagerDuty schedule key.
+        cost_center:
+          type: string
+          description: |
+            The chargeback key. It is copied into every access token and every usage record; a
+            token without it cannot reach `env=prod`.
+        manager:
+          type: string
+      additionalProperties: false
+
+    Quota:
+      type: object
+      description: The agent's declared consumption envelope.
+      required: [tokens_per_minute, requests_per_minute, monthly_token_budget]
+      properties:
+        tokens_per_minute:
+          type: integer
+          format: int64
+          description: Must be positive. Checked against the team's envelope by the `quota_declared` gate.
+        requests_per_minute:
+          type: integer
+          format: int64
+          description: Must be positive.
+        monthly_token_budget:
+          type: integer
+          format: int64
+        max_concurrent:
+          type: integer
+          format: int64
+          description: Omitted when the agent declares no concurrency ceiling.
+      additionalProperties: false
+
+    DataClassification:
+      type: string
+      description: |
+        The data-handling tier, ordered least to most sensitive. It selects the guardrail failure
+        mode — `restricted` is always fail-closed — and constrains which backends may serve the
+        agent's requests.
+      enum: [public, internal, confidential, restricted]
+
+    VersionState:
+      type: string
+      description: |
+        The lifecycle state of one version in one environment. A version has an independent state
+        in each environment it exists in, which is why the same version can be `active` in staging
+        and `blocked` in production at the same time.
+
+        * `registered` — known here, not yet serving. What a `staging` or `prod` registration
+          produces.
+        * `active` — serving traffic in this environment. The only state for which the control
+          plane will mint an access token. A `dev` registration produces this immediately.
+        * `pending_promotion` — the gate passed and human approval is outstanding. Written into the
+          **target** environment when a promotion is opened.
+        * `blocked` — the gate failed. Written into the **target** environment, with `notes` naming
+          the failed gates and `last_gate` carrying the evaluation.
+        * `retired` — superseded by a later promotion into this environment. Retired rather than
+          deleted, which is what makes an emergency rollback a state change instead of a redeploy.
+        * `quarantined` — forcibly disabled by the platform. Takes effect at the agent's next token
+          refresh.
+      enum:
+        - registered
+        - active
+        - pending_promotion
+        - blocked
+        - retired
+        - quarantined
+
+    Version:
+      type: object
+      description: One deployable version of an agent in one environment.
+      required: [version, env, state, registered_at]
+      properties:
+        version: {type: string}
+        env:
+          type: string
+          enum: [dev, staging, prod]
+        state:
+          $ref: '#/components/schemas/VersionState'
+        image: {type: string}
+        commit_sha: {type: string}
+        registered_at: {type: string, format: date-time}
+        registered_by: {type: string}
+        promoted_at:
+          type: [string, 'null']
+          format: date-time
+        promoted_by:
+          type: string
+          description: |
+            Comma-separated approver actors, or the literal `automatic` when the target
+            environment required no approvals.
+        retired_at:
+          type: [string, 'null']
+          format: date-time
+        last_gate:
+          description: |
+            The most recent gate evaluation for this version, retained verbatim so an auditor can
+            reconstruct why it was allowed into an environment.
+          oneOf:
+            - $ref: '#/components/schemas/GateResult'
+            - type: 'null'
+        notes:
+          type: string
+          description: |
+            Free text. A quarantine writes its actor, timestamp and reason here; a gate-blocked
+            promotion writes `blocked by promotion gate: <comma-separated gate names>`.
+      additionalProperties: false
+
+    Agent:
+      type: object
+      description: A registered agent and all of its versions.
+      required:
+        - agent_id
+        - identity
+        - display_name
+        - owner
+        - runtime
+        - data_classification
+        - requested_pools
+        - granted_pools
+        - quota
+        - versions
+        - created_at
+        - updated_at
+      properties:
+        agent_id:
+          type: string
+          description: 'Platform-assigned, stable: `agt_<20 hex>`.'
+        identity:
+          type: string
+          description: '`agent://<tenant>/<team>/<name>`. Unique across the platform.'
+        display_name: {type: string}
+        description: {type: string}
+        owner:
+          $ref: '#/components/schemas/Owner'
+        runtime:
+          type: string
+          description: For example `aks`, `eks`, `aca`, `vm`, `lambda`.
+        framework:
+          type: string
+          description: For example `langgraph`, `semantic-kernel`, `custom`.
+        data_classification:
+          $ref: '#/components/schemas/DataClassification'
+        requested_pools:
+          type: array
+          items: {type: string}
+          description: What the team asked for.
+        granted_pools:
+          type: array
+          items: {type: string}
+          description: |
+            What the platform team granted. This, not `requested_pools`, becomes the token's
+            `model_pools` claim. In non-production an empty grant falls back to the requested set;
+            in production an empty grant means no pools, and traffic is refused with
+            `forbidden_pool`.
+        quota:
+          $ref: '#/components/schemas/Quota'
+        versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Version'
+        security_review_ref:
+          type: string
+          description: A ServiceNow CHG or RITM reference. Required by the production gate.
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        labels:
+          type: object
+          additionalProperties: {type: string}
+          description: |
+            Free-form labels. `workload_subject` is load-bearing: when present it is the exact
+            workload subject that token exchange requires, replacing the substring fallback.
+      additionalProperties: false
+
+    RegistrationRequest:
+      type: object
+      description: |
+        What CI submits on deployment. Unknown fields are **rejected**, so a typo fails at
+        registration rather than being silently ignored.
+      required:
+        - identity
+        - display_name
+        - owner
+        - runtime
+        - data_classification
+        - requested_pools
+        - quota
+        - version
+        - env
+      properties:
+        identity:
+          type: string
+          description: |
+            `agent://<tenant>/<team>/<name>`. Each segment must be a DNS label (lower-case
+            alphanumerics and hyphens, 1–63 characters, not starting or ending with a hyphen) so
+            that an identity can appear unescaped in a metric label, a Kubernetes object name and a
+            SPIFFE ID.
+          pattern: '^agent://[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?/[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?/[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$'
+        display_name: {type: string}
+        description: {type: string}
+        owner:
+          $ref: '#/components/schemas/Owner'
+        runtime: {type: string}
+        framework: {type: string}
+        data_classification:
+          $ref: '#/components/schemas/DataClassification'
+        requested_pools:
+          type: array
+          minItems: 1
+          items: {type: string}
+        quota:
+          $ref: '#/components/schemas/Quota'
+        version: {type: string}
+        env:
+          type: string
+          enum: [dev, staging, prod]
+        image: {type: string}
+        commit_sha: {type: string}
+        security_review_ref: {type: string}
+        labels:
+          type: object
+          additionalProperties: {type: string}
+        issue_credential:
+          type: boolean
+          default: false
+          description: |
+            Ask for a client secret. Omitted by every pipeline that can use federated workload
+            identity. Setting it adds a warning to the response and produces an attestation the
+            production promotion gate refuses.
+      additionalProperties: false
+
+    RegistrationResult:
+      type: object
+      required: [agent, version, env, state]
+      properties:
+        agent:
+          $ref: '#/components/schemas/Agent'
+        version: {type: string}
+        env:
+          type: string
+          enum: [dev, staging, prod]
+        state:
+          $ref: '#/components/schemas/VersionState'
+        client_id:
+          type: string
+          description: Present only when a credential was issued.
+        client_secret:
+          type: string
+          description: |
+            Present only when a credential was issued. **Shown once.** It is stored in the vault
+            and only its SHA-256 hash is kept in the registry; it cannot be read back.
+        warnings:
+          type: array
+          items: {type: string}
+          description: |
+            Problems that do not block registration but will block promotion — no granted pools in
+            production, no linked security review, a client secret having been issued.
+      additionalProperties: false
+
+    IssuedCredential:
+      type: object
+      required: [client_id, client_secret, expires_at, warning]
+      properties:
+        client_id: {type: string}
+        client_secret:
+          type: string
+          description: Shown once. Prefixed `ags_`.
+        expires_at:
+          type: string
+          format: date-time
+          description: 90 days from issuance by default.
+        warning: {type: string}
+      additionalProperties: false
+
+    RotatedCredential:
+      type: object
+      required: [client_id, client_secret, previous_valid_until]
+      properties:
+        client_id: {type: string}
+        client_secret: {type: string, description: Shown once.}
+        previous_valid_until:
+          type: string
+          format: date-time
+          description: When the rotated-out secret stops working.
+      additionalProperties: false
+
+    QuarantineRequest:
+      type: object
+      required: [version, env, reason]
+      properties:
+        version: {type: string}
+        env:
+          type: string
+          enum: [dev, staging, prod]
+        reason:
+          type: string
+          description: Required. A quarantine without a recorded reason cannot be reviewed.
+      additionalProperties: false
+
+    CheckStatus:
+      type: string
+      description: |
+        The outcome of one gate. `waived` means the gate failed but an active waiver covers it —
+        the failure is still visible in the evidence, which is the point.
+      enum: [pass, fail, waived, skipped]
+
+    GateCheck:
+      type: object
+      description: One evaluated gate with the evidence behind it.
+      required: [name, status, detail]
+      properties:
+        name:
+          type: string
+          description: |
+            A stable gate name. These strings appear in audit records, metrics and CI output.
+          enum:
+            - registration_complete
+            - identity_attested
+            - telemetry_healthy
+            - error_budget
+            - guardrail_clean
+            - quota_declared
+            - cost_projection
+            - security_review
+        status:
+          $ref: '#/components/schemas/CheckStatus'
+        detail:
+          type: string
+          description: What the gate requires, in the words an engineer reads in CI output.
+        observed:
+          type: string
+          description: What was actually measured.
+        required:
+          type: string
+          description: What would have passed.
+        waiver_id:
+          type: string
+          description: Present when `status` is `waived`.
+      additionalProperties: false
+
+    GateResult:
+      type: object
+      description: |
+        The full evaluation snapshot for one promotion attempt, stored verbatim so that "why was
+        this allowed into production" is answerable months later without re-running anything.
+      required: [agent_id, version, from, to, checks, passed, evaluated_at, evaluator]
+      properties:
+        agent_id: {type: string}
+        version: {type: string}
+        from:
+          type: string
+          enum: [dev, staging, prod]
+        to:
+          type: string
+          enum: [dev, staging, prod]
+        checks:
+          type: array
+          items:
+            $ref: '#/components/schemas/GateCheck'
+        passed:
+          type: boolean
+          description: True when no check has status `fail`. `waived` and `skipped` do not block.
+        evaluated_at: {type: string, format: date-time}
+        evaluator:
+          type: string
+          description: Always `agentgate-controlplane`.
+      additionalProperties: false
+
+    ApproverRole:
+      type: string
+      description: |
+        The two parties a production promotion requires. Both must be satisfied, by different
+        people, neither of whom is the requester.
+      enum: [owning_team, platform]
+
+    Approval:
+      type: object
+      description: One recorded human decision.
+      required: [actor, role, approved, at]
+      properties:
+        actor:
+          type: string
+          description: The authenticated principal, taken from the token, never from the body.
+        role:
+          $ref: '#/components/schemas/ApproverRole'
+        approved: {type: boolean}
+        comment: {type: string}
+        at: {type: string, format: date-time}
+      additionalProperties: false
+
+    ApprovalRequest:
+      type: object
+      description: |
+        The body of an approve call. The actor is **not** in the body: it comes from the
+        authenticated principal, which is what makes the audit record worth having.
+      required: [role, approved]
+      properties:
+        role:
+          $ref: '#/components/schemas/ApproverRole'
+        approved:
+          type: boolean
+          description: False records a rejection, which moves the promotion straight to `rejected`.
+        comment: {type: string}
+      additionalProperties: false
+
+    PromotionState:
+      type: string
+      description: |
+        `blocked` means the automated gate failed. `pending` means the gate passed and human
+        approval is outstanding. `applied` means the version is now active in the target
+        environment. `expired` means the approval window closed.
+      enum: [pending, approved, rejected, applied, expired, blocked]
+
+    PromotionCreateRequest:
+      type: object
+      required: [agent_id, version, to]
+      properties:
+        agent_id: {type: string}
+        version:
+          type: string
+          description: Must already be registered in the source environment.
+        to:
+          type: string
+          enum: [staging, prod]
+          description: |
+            The target. The source is derived: `dev` for a `staging` target, `staging` for a `prod`
+            target. `dev` is not a promotion target.
+      additionalProperties: false
+
+    PromotionRequest:
+      type: object
+      description: The auditable record of one promotion attempt.
+      required: [id, agent_id, identity, version, from, to, requested_by, requested_at, expires_at, gate, approvals, state]
+      properties:
+        id:
+          type: string
+          description: '`prm_<uuid>`.'
+        agent_id: {type: string}
+        identity: {type: string}
+        version: {type: string}
+        from:
+          type: string
+          enum: [dev, staging]
+        to:
+          type: string
+          enum: [staging, prod]
+        requested_by: {type: string}
+        requested_at: {type: string, format: date-time}
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            The approval window closes here — 72 hours after the request by default. An approval
+            recorded after it moves the request to `expired` instead.
+        gate:
+          $ref: '#/components/schemas/GateResult'
+        approvals:
+          type: array
+          items:
+            $ref: '#/components/schemas/Approval'
+        state:
+          $ref: '#/components/schemas/PromotionState'
+        change_ref:
+          type: string
+          description: |
+            The enterprise change record reference. When no workflow integration is configured this
+            is a `MANUAL-xxxxxxxx` reference and the change payload is printed for a human to file;
+            the promotion still cannot happen without two recorded approvals.
+        applied_at:
+          type: [string, 'null']
+          format: date-time
+      additionalProperties: false
+
+    PromotionGateBlocked:
+      type: object
+      description: |
+        The 409 body returned when the automated promotion gate refuses. A purpose-built envelope
+        rather than an RFC 9457 problem document, because a problem document has nowhere to put the
+        gate evidence and the evidence is the point.
+      required: [code, title, detail, failed_gates, promotion]
+      properties:
+        code:
+          type: string
+          const: promotion_gate_blocked
+          description: |
+            The stable error code, frozen at HTTP 409. Branch on this rather than on the status
+            alone: an approval call also returns 409, with a different body.
+        title:
+          type: string
+          description: Always `Promotion gate blocked`.
+        detail:
+          type: string
+          description: A short human-readable summary pointing at the structured fields.
+        failed_gates:
+          type: array
+          items:
+            type: string
+          description: |
+            Names of the checks whose status is `fail`, for a caller that only needs a reason to
+            print before exiting non-zero. Checks that are `waived` or `skipped` are **not** listed
+            here — they did not block. An empty array cannot occur on this response.
+          example: [telemetry_healthy]
+        promotion:
+          allOf:
+            - $ref: '#/components/schemas/PromotionRequest'
+          description: |
+            The full promotion record, with `state: blocked` and the verbatim gate evaluation in
+            `gate.checks` — every check, including the ones that passed, with what was observed and
+            what was required. This is the same document `GET /api/v1/promotions/{id}` returns, and
+            it is persisted, so the refusal is auditable rather than merely reported.
+      additionalProperties: true
+
+    WaiverRequest:
+      type: object
+      required: [agent_id, gate, reason]
+      properties:
+        agent_id: {type: string}
+        gate:
+          type: string
+          description: The gate name to waive. Must match a name from `GateCheck.name`.
+        reason:
+          type: string
+          description: Required. It appears verbatim in the gate evidence.
+        days:
+          type: integer
+          minimum: 1
+          maximum: 90
+          default: 30
+          description: Clamped to (0, 90]. A value outside that range becomes 30.
+      additionalProperties: false
+
+    Waiver:
+      type: object
+      description: |
+        An accepted exception to a gate, with an owner and an expiry so exceptions cannot quietly
+        become permanent.
+      required: [id, agent_id, gate, reason, granted_by, granted_at, expires_at]
+      properties:
+        id:
+          type: string
+          description: '`wvr_<uuid>`.'
+        agent_id: {type: string}
+        gate: {type: string}
+        reason: {type: string}
+        granted_by: {type: string}
+        granted_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+      additionalProperties: false
+
+    VersionInfo:
+      type: object
+      required: [version, commit, build_date, go_version, platform]
+      properties:
+        version: {type: string}
+        commit: {type: string}
+        build_date: {type: string}
+        go_version: {type: string}
+        platform: {type: string}
+      additionalProperties: false
+
+    CPReadiness:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        checks:
+          type: object
+          properties:
+            registry:
+              type: boolean
+              description: Whether the registry answered a list query.
+            signing_key:
+              type: boolean
+              description: Whether a signing key is active. Without one no identity can be issued.
+          additionalProperties: true
+      additionalProperties: false
+
+    Problem:
+      type: object
+      description: |
+        RFC 9457 problem details, the same document the gateway returns. See `gateway.v1.yaml` for
+        the complete error-code set; the codes the management surface produces are
+        `invalid_request`, `unauthenticated`, `forbidden_pool`, `not_found`, `conflict` and
+        `agent_not_promoted`.
+      required: [type, title, status, code]
+      properties:
+        type: {type: string, format: uri}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        code: {type: string}
+        request_id: {type: string}
+        trace_id: {type: string}
+        retry_after_seconds: {type: integer}
+        param: {type: string}
+      additionalProperties: true
+
+  responses:
+
+    InvalidRequest:
+      description: |
+        `400 invalid_request` — the body was malformed, carried an unknown field, or failed
+        validation. The detail names the fields, because it is read by whoever is fixing the CI
+        pipeline.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            missingFields:
+              value:
+                type: https://agentgate.internal/errors/invalid_request
+                title: Invalid request
+                status: 400
+                detail: 'registration is missing required fields: owner.oncall, owner.cost_center'
+                code: invalid_request
+
+    Unauthenticated:
+      description: '`401 unauthenticated` — no bearer token, or it could not be verified.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            missing:
+              value:
+                type: https://agentgate.internal/errors/unauthenticated
+                title: Unauthenticated
+                status: 401
+                detail: a bearer token is required
+                code: unauthenticated
+
+    Forbidden:
+      description: |
+        `403 forbidden_pool` — the token does not carry the scope this operation requires. The code
+        is shared with the gateway's pool-entitlement failure; branch on the HTTP status and read
+        `detail` to see which scope was wanted.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            missingScope:
+              value:
+                type: https://agentgate.internal/errors/forbidden_pool
+                title: Pool not permitted for this agent
+                status: 403
+                detail: this token does not carry the agents:promote scope
+                code: forbidden_pool
+
+    NotFound:
+      description: '`404 not_found` — no such agent, version, promotion or credential.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            noAgent:
+              value:
+                type: https://agentgate.internal/errors/not_found
+                title: Not found
+                status: 404
+                detail: 'not found: version 2.5.0 in staging'
+                code: not_found
+
+    Conflict:
+      description: |
+        `409 conflict` — the operation contradicts existing state: an identity already registered
+        to a different owning team, or a credential that does not belong to the named agent.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            ownership:
+              value:
+                type: https://agentgate.internal/errors/conflict
+                title: Conflict
+                status: 409
+                detail: 'conflict: agent agent://fsclient/payments-risk/dispute-triage is owned by payments-risk; transferring ownership requires a platform action'
+                code: conflict

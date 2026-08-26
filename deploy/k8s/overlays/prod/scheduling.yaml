@@ -1,0 +1,84 @@
+# Production scheduling. Zone spread becomes DoNotSchedule: in prod, a
+# scheduler that quietly packs the traffic plane into one availability zone
+# has removed the redundancy the SLO assumes, and it does so silently. Better
+# to have pods stay Pending and page than to look healthy and be one zone
+# failure from an outage.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: agentgate
+spec:
+  template:
+    spec:
+      priorityClassName: agentgate-critical
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+      containers:
+        - name: gateway
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              memory: 4Gi
+          env:
+            - name: GOMEMLIMIT
+              value: "3400MiB"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controlplane
+  namespace: agentgate
+spec:
+  template:
+    spec:
+      priorityClassName: agentgate-critical
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: controlplane
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: controlplane
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: guardrails
+  namespace: agentgate
+spec:
+  template:
+    spec:
+      priorityClassName: agentgate-critical
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: guardrails
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: guardrails

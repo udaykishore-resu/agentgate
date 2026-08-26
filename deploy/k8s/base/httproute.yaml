@@ -1,0 +1,188 @@
+# North-south routing via the Gateway API.
+#
+# Gateway API rather than Ingress because two things AgentGate needs are not
+# expressible in Ingress without controller-specific annotations: per-route
+# timeouts (streaming completions must not inherit a 60s proxy default) and
+# cross-namespace route attachment with an explicit grant. An Ingress
+# equivalent is provided in ingress-alternative.yaml for clusters that do not
+# have Gateway API installed.
+
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: agentgate-internal
+  namespace: gateway-system
+  labels:
+    app.kubernetes.io/part-of: agentgate
+  annotations:
+    # Internal load balancer only. There is no public listener anywhere in this
+    # platform; external consumers arrive through API Management, which is
+    # itself VNet-injected (SPEC §8 row 1).
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+spec:
+  gatewayClassName: agentgate-internal
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.agentgate.internal"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: agentgate-internal-tls
+        options:
+          # TLS 1.3 only on the internal path (SPEC §8 row 1). Every client is
+          # first-party and modern, so there is no compatibility argument for
+          # keeping 1.2 ciphers available.
+          gateway.networking.k8s.io/tls-min-version: "1.3"
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              app.kubernetes.io/part-of: agentgate
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: gateway
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: agentgate
+spec:
+  parentRefs:
+    - name: agentgate-internal
+      namespace: gateway-system
+      sectionName: https
+  hostnames:
+    - gateway.agentgate.internal
+  rules:
+    # The frozen v1 contract (SPEC §2). Path prefix only — routing by
+    # endpoint would let one endpoint's behaviour drift from another's, which
+    # the migration plan in SPEC §7 explicitly forbids ("cut over per
+    # consumer, never per endpoint").
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      backendRefs:
+        - name: gateway
+          port: 8080
+          weight: 100
+      timeouts:
+        # A streamed long-context generation can legitimately run for minutes,
+        # and the gateway already enforces its own deadline and heartbeats
+        # every 15s. A proxy-level timeout here would cut streams that the
+        # gateway considers healthy.
+        request: 0s
+        backendRequest: 0s
+      retry:
+        # The gateway owns retry policy, including the budget that prevents
+        # retry storms (SPEC §3.3). A retry here would be invisible to that
+        # budget and would double-charge the caller's token quota.
+        attempts: 0
+    - matches:
+        - path:
+            type: Exact
+            value: /healthz
+        - path:
+            type: Exact
+            value: /readyz
+      backendRefs:
+        - name: gateway
+          port: 8080
+      timeouts:
+        request: 5s
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: controlplane
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/part-of: agentgate
+spec:
+  parentRefs:
+    - name: agentgate-internal
+      namespace: gateway-system
+      sectionName: https
+  hostnames:
+    - controlplane.agentgate.internal
+  rules:
+    # Token exchange and JWKS. JWKS must be reachable by the gateway on every
+    # key rotation, so it is served on the same host as the issuer claim in the
+    # token — anything else breaks OIDC discovery.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+        - path:
+            type: PathPrefix
+            value: /.well-known
+      backendRefs:
+        - name: controlplane
+          port: 8081
+      timeouts:
+        request: 10s
+        backendRequest: 5s
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: fleetview
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: fleetview
+    app.kubernetes.io/part-of: agentgate
+spec:
+  parentRefs:
+    - name: agentgate-internal
+      namespace: gateway-system
+      sectionName: https
+  hostnames:
+    - fleet.agentgate.internal
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: fleetview
+          port: 8082
+      timeouts:
+        # Chargeback exports over a full month are large aggregations.
+        request: 120s
+        backendRequest: 115s
+---
+# Serving certificate from the enterprise PKI via cert-manager. 90-day
+# lifetime with renewal at 30 days remaining (SPEC §8): renewal has three
+# chances to succeed before the 21-day CertificateExpiringSoon alert fires and
+# a human is involved.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: agentgate-internal-tls
+  namespace: gateway-system
+  labels:
+    app.kubernetes.io/part-of: agentgate
+spec:
+  secretName: agentgate-internal-tls
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  dnsNames:
+    - gateway.agentgate.internal
+    - controlplane.agentgate.internal
+    - fleet.agentgate.internal
+  issuerRef:
+    name: enterprise-pki
+    kind: ClusterIssuer
+    group: cert-manager.io

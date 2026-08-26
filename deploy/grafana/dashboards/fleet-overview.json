@@ -1,0 +1,551 @@
+{
+  "uid": "agentgate-fleet-overview",
+  "title": "AgentGate — Fleet Overview",
+  "description": "Who is on the platform, whether their telemetry can be trusted, and which agents are eligible for promotion. Telemetry completeness is a hard promotion gate (SPEC §1.4), so this dashboard is a release tool as much as an observability one.",
+  "tags": ["agentgate", "fleet", "telemetry"],
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "label": "Environment",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+        "query": "label_values(agentgate_fleet_agents, env)",
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "sort": 1,
+        "current": {}
+      },
+      {
+        "name": "team",
+        "label": "Team",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+        "query": "label_values(agentgate_gateway_requests_total{env=\"$env\"}, team)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "sort": 1,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "Fleet inventory",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Registered agents",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum(agentgate_fleet_agents{env=\"$env\"})",
+          "legendFormat": "agents"
+        }
+      ]
+    },
+    {
+      "type": "piechart",
+      "id": 2,
+      "title": "Agents by lifecycle state",
+      "description": "pending_promotion counts are the queue the promotion gate is working through.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 4, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "pieType": "donut",
+        "displayLabels": ["name", "value"],
+        "legend": { "displayMode": "list", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (state) (agentgate_fleet_agents{env=\"$env\"})",
+          "legendFormat": "{{state}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Agents below telemetry objective (< 0.98)",
+      "description": "These agents cannot be promoted to production until completeness recovers.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 4, "x": 10, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "agentgate:telemetry_completeness:agents_below_objective{env=\"$env\"}",
+          "legendFormat": "agents"
+        }
+      ]
+    },
+    {
+      "type": "gauge",
+      "id": 4,
+      "title": "Fleet telemetry completeness (5th percentile)",
+      "description": "The 5th percentile rather than the mean: an average of 0.99 hides twenty agents at 0.4.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 14, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.95 },
+              { "color": "green", "value": 0.98 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "agentgate:telemetry_completeness:fleet_p05{env=\"$env\"}",
+          "legendFormat": "p05 completeness"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 5,
+      "title": "Requests needing ownership correction",
+      "description": "Agents whose self-declared ownership disagreed with their verified token. Chargeback is still correct; the agents' own dashboards are not.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 19, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.01 },
+              { "color": "red", "value": 0.05 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum(rate(agentgate_gateway_requests_total{env=\"$env\",attribution_corrected=\"true\"}[30m])) / clamp_min(sum(rate(agentgate_gateway_requests_total{env=\"$env\"}[30m])), 1e-9)",
+          "legendFormat": "corrected"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 101,
+      "title": "Telemetry trust (SPEC §4.5)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "table",
+      "id": 10,
+      "title": "Agents failing the telemetry promotion gate",
+      "description": "Ordered worst first. Each row is an agent that cannot be promoted to production right now.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3,
+          "custom": { "align": "auto", "cellOptions": { "type": "color-text" }, "filterable": true },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.95 },
+              { "color": "green", "value": 0.98 }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value" },
+            "properties": [{ "id": "displayName", "value": "completeness" }]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" },
+        "sortBy": [{ "displayName": "completeness", "desc": false }]
+      },
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true } } }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "bottomk(25, agentgate_telemetry_completeness{env=\"$env\"})"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 11,
+      "title": "Telemetry pipeline health",
+      "description": "Refused and failed spans in either collector tier. Non-zero here means every other number on this dashboard is computed from incomplete data.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.001 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (tier) (rate(otelcol_processor_refused_spans_total[$__rate_interval]))",
+          "legendFormat": "refused / {{tier}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (tier) (rate(otelcol_exporter_send_failed_spans_total[$__rate_interval]))",
+          "legendFormat": "export failed / {{tier}}"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum(rate(otelcol_processor_tail_sampling_sampling_trace_dropped_too_early[$__rate_interval]))",
+          "legendFormat": "tail sampling evictions"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 102,
+      "title": "Consumption by team",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 20,
+      "title": "Request rate by team",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "stacking": { "mode": "normal", "group": "A" },
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (team) (rate(agentgate_gateway_requests_total{env=\"$env\",team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "{{team}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 21,
+      "title": "Token throughput by direction",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "stacking": { "mode": "normal", "group": "A" },
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (direction) (rate(agentgate_gateway_tokens_total{env=\"$env\",team=~\"$team\"}[$__rate_interval]))",
+          "legendFormat": "{{direction}} tokens/s"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 30,
+      "title": "Agent inventory",
+      "description": "One row per agent: traffic, quota pressure and telemetry trust in one place. This is the view used in the weekly promotion review.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 11, "w": 24, "x": 0, "y": 26 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "filterable": true },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value #A" },
+            "properties": [
+              { "id": "displayName", "value": "req/s" },
+              { "id": "unit", "value": "reqps" },
+              { "id": "decimals", "value": 2 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Value #B" },
+            "properties": [
+              { "id": "displayName", "value": "completeness" },
+              { "id": "unit", "value": "percentunit" },
+              { "id": "custom.cellOptions", "value": { "type": "color-background" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "orange", "value": 0.95 },
+                    { "color": "green", "value": 0.98 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Value #C" },
+            "properties": [
+              { "id": "displayName", "value": "monthly budget used" },
+              { "id": "unit", "value": "percentunit" },
+              { "id": "custom.cellOptions", "value": { "type": "gauge", "mode": "gradient" } },
+              { "id": "max", "value": 1 },
+              { "id": "min", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Value #D" },
+            "properties": [
+              { "id": "displayName", "value": "USD/hour" },
+              { "id": "unit", "value": "currencyUSD" },
+              { "id": "decimals", "value": 3 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "footer": { "show": true, "reducer": ["sum"], "countRows": false, "fields": ["Value #D"] },
+        "sortBy": [{ "displayName": "req/s", "desc": true }]
+      },
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": { "byField": "agent", "mode": "outer" }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "__name__": true,
+              "job": true,
+              "instance": true,
+              "env 2": true,
+              "env 3": true,
+              "env 4": true
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (agent, team, tenant) (rate(agentgate_gateway_requests_total{env=\"$env\",team=~\"$team\"}[$__rate_interval]))"
+        },
+        {
+          "refId": "B",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "agentgate_telemetry_completeness{env=\"$env\"}"
+        },
+        {
+          "refId": "C",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "max by (agent) (agentgate_quota_monthly_budget_used_ratio{env=\"$env\",team=~\"$team\"})"
+        },
+        {
+          "refId": "D",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (agent) (rate(agentgate_gateway_cost_usd_total{env=\"$env\",team=~\"$team\"}[1h])) * 3600"
+        }
+      ]
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  }
+}

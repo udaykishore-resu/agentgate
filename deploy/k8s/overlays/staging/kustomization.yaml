@@ -1,0 +1,167 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# staging — production's shape at a third of its size.
+#
+# Staging exists to answer the promotion gate's questions (SPEC §1.4): has this
+# agent attested with workload identity, is its telemetry complete, is it
+# inside its error budget. Those answers are only meaningful if staging
+# behaves like production, so the differences from the base are quantitative
+# (fewer replicas, more sampling) rather than qualitative.
+#
+# What differs, and why:
+#   replicas            2 of each service, HPAs capped lower.
+#   content capture     `redacted` — non-prod default, and the promotion gate
+#                       reviews redacted content for guardrail evidence.
+#   guardrails          fail_open, matching the base pool policy.
+#   tail sampling       20% baseline. Enough to characterise behaviour over a
+#                       soak test without paying prod storage.
+#   image tag           immutable release-candidate tag.
+
+namespace: agentgate
+
+resources:
+  - ../../base
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/environment: staging
+
+images:
+  - name: ghcr.io/agentgate/gateway
+    newTag: 1.0.0-rc.1
+  - name: ghcr.io/agentgate/controlplane
+    newTag: 1.0.0-rc.1
+  - name: ghcr.io/agentgate/fleetview
+    newTag: 1.0.0-rc.1
+  - name: ghcr.io/agentgate/guardrails
+    newTag: 1.0.0-rc.1
+
+replicas:
+  - name: gateway
+    count: 2
+  - name: controlplane
+    count: 2
+  - name: fleetview
+    count: 1
+  - name: guardrails
+    count: 2
+  - name: otel-collector-gateway
+    count: 2
+
+patches:
+  - path: common-config.yaml
+  - path: sampling.yaml
+
+  # Lower ceilings: a load test in staging should hit a wall we chose rather
+  # than consuming the cluster.
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: gateway
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 10
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: guardrails
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 8
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: controlplane
+    patch: |-
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: otel-collector-gateway
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 6
+
+  # guardrails' base PDB requires 2 available, which cannot be met at 2
+  # replicas during a node drain.
+  - target:
+      kind: PodDisruptionBudget
+      name: guardrails
+    patch: |-
+      - op: remove
+        path: /spec/minAvailable
+      - op: add
+        path: /spec/maxUnavailable
+        value: 1
+  - target:
+      kind: PodDisruptionBudget
+      name: otel-collector-gateway
+    patch: |-
+      - op: remove
+        path: /spec/minAvailable
+      - op: add
+        path: /spec/maxUnavailable
+        value: 1
+  - target:
+      kind: PodDisruptionBudget
+      name: fleetview
+    patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: fleetview
+
+  - target:
+      kind: SecretStore
+      name: azure-keyvault
+    patch: |-
+      - op: replace
+        path: /spec/provider/azurekv/vaultUrl
+        value: https://agentgate-kv-stg.vault.azure.net
+
+  # Hostnames are per-environment; the certificate must match or every internal
+  # caller fails TLS verification.
+  - target:
+      kind: Certificate
+      name: agentgate-internal-tls
+    patch: |-
+      - op: replace
+        path: /spec/dnsNames
+        value:
+          - gateway.stg.agentgate.internal
+          - controlplane.stg.agentgate.internal
+          - fleet.stg.agentgate.internal
+  - target:
+      kind: HTTPRoute
+      name: gateway
+    patch: |-
+      - op: replace
+        path: /spec/hostnames
+        value: ["gateway.stg.agentgate.internal"]
+  - target:
+      kind: HTTPRoute
+      name: controlplane
+    patch: |-
+      - op: replace
+        path: /spec/hostnames
+        value: ["controlplane.stg.agentgate.internal"]
+  - target:
+      kind: HTTPRoute
+      name: fleetview
+    patch: |-
+      - op: replace
+        path: /spec/hostnames
+        value: ["fleet.stg.agentgate.internal"]

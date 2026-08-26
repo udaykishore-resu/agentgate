@@ -1,0 +1,260 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: agentgate
+data:
+  # Cluster-shaped gateway configuration. Differences from the compose config
+  # in deploy/compose/agentgate.local.yaml are all about the network: provider
+  # base URLs are Private Endpoint / PrivateLink names that never resolve
+  # publicly, and Redis/Postgres are private too. The routing, resilience and
+  # guardrail semantics are identical, on purpose — a policy that only exists
+  # in production is a policy nobody has tested.
+  agentgate.yaml: |
+    server:
+      http_addr: ":8080"
+      metrics_addr: ":9090"
+      read_header_timeout: 10s
+      write_timeout: 300s
+      idle_timeout: 120s
+      # Must be shorter than terminationGracePeriodSeconds so in-flight
+      # streams finish before the kubelet sends SIGKILL.
+      shutdown_grace: 25s
+      max_request_bytes: 8388608
+
+    identity:
+      issuer: "https://controlplane.agentgate.internal"
+      audience: "https://gateway.agentgate.internal"
+      jwks_url: "https://controlplane.agentgate.internal/.well-known/jwks.json"
+      jwks_refresh_interval: 5m
+      jti_replay_window: 15m
+      clock_skew_leeway: 60s
+      require_cost_center_for_envs: ["prod"]
+
+    controlplane:
+      url: "http://controlplane.agentgate.svc.cluster.local:8081"
+      timeout: 3s
+      cache_ttl: 30s
+      # Registry lookups fall back to stale data for 10 minutes if the control
+      # plane is unavailable. Model traffic must not stop because the identity
+      # plane is being upgraded.
+      stale_if_error: 10m
+
+    telemetry:
+      # Node-local collector via the Downward API host IP, so telemetry never
+      # crosses a node boundary before it is batched.
+      otlp_endpoint: "${NODE_IP}:4317"
+      otlp_insecure: true
+      service_name: "gateway"
+      trace_sample_ratio: 1.0
+      metrics_interval: 15s
+      capture_content: "off"
+
+    ratelimit:
+      backend: "redis"
+      redis_addr: "${AGENTGATE_REDIS_ADDR}"
+      default_requests_per_minute: 600
+      default_tokens_per_minute: 120000
+      token_estimator: "tokenizer"
+
+    cache:
+      enabled: true
+      backend: "redis"
+      redis_addr: "${AGENTGATE_REDIS_ADDR}"
+      ttl: 15m
+      max_entry_bytes: 262144
+      max_temperature: 0.2
+      allow_tool_calls: false
+      semantic:
+        enabled: false
+        threshold: 0.97
+
+    guardrails:
+      provider: "callout"
+      url: "http://guardrails.agentgate.svc.cluster.local:8083"
+      timeout: 1500ms
+      failure_mode: "fail_open"
+      stream_window_tokens: 256
+
+    resilience:
+      retry:
+        max_attempts: 3
+        initial_backoff: 100ms
+        max_backoff: 2s
+        jitter: "full"
+        budget_ratio: 0.25
+        fleet_budget_ratio: 0.10
+      breaker:
+        window_size: 50
+        failure_rate_threshold: 0.5
+        consecutive_failures: 10
+        open_duration: 30s
+        half_open_probes: 5
+      load_shedding:
+        # Matches the HPA's custom-metric target of 200 in-flight per pod with
+        # headroom, so scaling happens before shedding does.
+        max_inflight: 512
+        shed_priority_order: ["batch", "interactive"]
+      deadline:
+        default_request_timeout: 120s
+
+    providers:
+      # All three reach their backend over a private path only (SPEC §8):
+      # Azure OpenAI via Private Endpoint, Bedrock via VPC endpoint, on-prem
+      # via ExpressRoute/Direct Connect with an internal CA.
+      - name: "azure-openai"
+        adapter: "azure-openai"
+        base_url: "https://agentgate-openai.privatelink.openai.azure.com"
+        api_version: "2024-10-21"
+        auth: "workload-identity"
+        timeout: 60s
+        max_concurrency: 256
+      - name: "bedrock"
+        adapter: "bedrock"
+        base_url: "https://bedrock-runtime.eu-west-1.amazonaws.com"
+        region: "eu-west-1"
+        auth: "workload-identity"
+        timeout: 60s
+        max_concurrency: 256
+      - name: "onprem-vllm"
+        adapter: "openai-compatible"
+        base_url: "https://inference.onprem.client.internal"
+        # Internal CA pinning for the on-prem path, per the crypto review.
+        tls_ca_file: "/etc/agentgate/pki/onprem-ca.pem"
+        timeout: 90s
+        max_concurrency: 64
+
+    pools:
+      - name: "general-chat"
+        strategy: "weighted-least-load"
+        tier: "interactive"
+        guardrail_failure_mode: "fail_open"
+        backends:
+          - provider: "azure-openai"
+            model: "gpt-4o-mini"
+            weight: 60
+            priority: 1
+            max_concurrency: 128
+            timeout: 30s
+            cost_per_1m_input_usd: 0.15
+            cost_per_1m_output_usd: 0.60
+            data_classification: ["public", "internal", "confidential"]
+            residency: ["eu"]
+          - provider: "bedrock"
+            model: "anthropic.claude-3-5-haiku-20241022-v1:0"
+            weight: 40
+            priority: 1
+            max_concurrency: 128
+            timeout: 30s
+            cost_per_1m_input_usd: 0.80
+            cost_per_1m_output_usd: 4.00
+            data_classification: ["public", "internal", "confidential"]
+            residency: ["eu"]
+          - provider: "onprem-vllm"
+            model: "llama-3.1-8b-instruct"
+            weight: 100
+            priority: 2
+            max_concurrency: 32
+            timeout: 60s
+            cost_per_1m_input_usd: 0.02
+            cost_per_1m_output_usd: 0.02
+            data_classification: ["public", "internal", "confidential", "restricted"]
+            residency: ["eu", "onprem"]
+
+      - name: "long-context"
+        strategy: "weighted-least-load"
+        tier: "batch"
+        guardrail_failure_mode: "fail_open"
+        backends:
+          - provider: "azure-openai"
+            model: "gpt-4o"
+            weight: 100
+            priority: 1
+            max_concurrency: 32
+            timeout: 120s
+            cost_per_1m_input_usd: 2.50
+            cost_per_1m_output_usd: 10.00
+            data_classification: ["public", "internal", "confidential"]
+            residency: ["eu"]
+
+      - name: "restricted-onprem"
+        strategy: "weighted-least-load"
+        tier: "interactive"
+        # Restricted data: no cloud backend is eligible and the guardrail must
+        # answer before anything is sent.
+        guardrail_failure_mode: "fail_closed"
+        backends:
+          - provider: "onprem-vllm"
+            model: "llama-3.1-8b-instruct"
+            weight: 100
+            priority: 1
+            max_concurrency: 32
+            timeout: 90s
+            cost_per_1m_input_usd: 0.02
+            cost_per_1m_output_usd: 0.02
+            data_classification: ["restricted"]
+            residency: ["onprem"]
+
+      - name: "embeddings"
+        strategy: "weighted-least-load"
+        tier: "batch"
+        guardrail_failure_mode: "fail_open"
+        backends:
+          - provider: "azure-openai"
+            model: "text-embedding-3-large"
+            weight: 100
+            priority: 1
+            max_concurrency: 128
+            timeout: 30s
+            cost_per_1m_input_usd: 0.13
+            cost_per_1m_output_usd: 0.00
+            data_classification: ["public", "internal", "confidential"]
+            residency: ["eu"]
+
+    models:
+      - name: "general-chat"
+        pool: "general-chat"
+        context_window: 128000
+        capabilities: ["chat", "tools", "streaming", "json_mode"]
+      - name: "long-context"
+        pool: "long-context"
+        context_window: 128000
+        capabilities: ["chat", "tools", "streaming", "json_mode"]
+      - name: "restricted-chat"
+        pool: "restricted-onprem"
+        context_window: 32000
+        capabilities: ["chat", "streaming"]
+      - name: "text-embedding"
+        pool: "embeddings"
+        context_window: 8191
+        capabilities: ["embeddings"]
+
+    usage:
+      # Event Hubs on Azure, Kinesis/MSK on AWS — the overlay sets the DSN.
+      sink: "stream"
+      dsn: "${AGENTGATE_USAGE_STREAM_DSN}"
+      flush_interval: 5s
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentgate-common
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/part-of: agentgate
+data:
+  # Values shared by every service and patched per environment by the overlays.
+  AGENTGATE_ENV: "prod"
+  AGENTGATE_LOG_LEVEL: "info"
+  AGENTGATE_CONTROLPLANE_URL: "http://controlplane.agentgate.svc.cluster.local:8081"
+  AGENTGATE_GUARDRAIL_URL: "http://guardrails.agentgate.svc.cluster.local:8083"
+  AGENTGATE_PROM_URL: "http://prometheus-operated.monitoring.svc.cluster.local:9090"
+  AGENTGATE_OIDC_ISSUER: "https://controlplane.agentgate.internal"
+  AGENTGATE_OIDC_JWKS_URL: "https://controlplane.agentgate.internal/.well-known/jwks.json"
+  AGENTGATE_SERVICENOW_URL: "https://client.service-now.com/api/now/table/change_request"
+  AGENTGATE_VAULT_ADDR: "https://agentgate-kv.vault.azure.net"
+  # SPEC §4.2: financial-services default is off in prod.
+  AGENTGATE_CAPTURE_CONTENT: "off"

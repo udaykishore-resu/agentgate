@@ -1,0 +1,15 @@
+# Preemption priority for the traffic and trust planes.
+#
+# Below system-cluster-critical (which is for the control plane of the cluster
+# itself) and well above the default. When a node fills, the scheduler should
+# evict a batch agent workload before it evicts the gateway those agents
+# depend on — otherwise a noisy tenant can take out the platform that is
+# supposed to be rate-limiting it.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: agentgate-critical
+value: 1000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "AgentGate traffic and trust planes — evict tenant workloads before these."

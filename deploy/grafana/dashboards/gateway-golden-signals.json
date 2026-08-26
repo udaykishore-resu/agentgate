@@ -1,0 +1,750 @@
+{
+  "uid": "agentgate-gateway-golden",
+  "title": "AgentGate — Gateway Golden Signals",
+  "description": "Traffic, errors, latency and saturation for the gateway, plus the resilience mechanisms that sit between them. Panels are ordered the way an incident is triaged: is it broken, for whom, where, and which mechanism is absorbing it.",
+  "tags": ["agentgate", "gateway", "slo"],
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "links": [
+    {
+      "title": "Fleet overview",
+      "type": "dashboards",
+      "tags": ["agentgate"],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "",
+      "url": ""
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "label": "Environment",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+        "query": "label_values(agentgate_gateway_requests_total, env)",
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "sort": 1,
+        "current": {}
+      },
+      {
+        "name": "pool",
+        "label": "Pool",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+        "query": "label_values(agentgate_gateway_requests_total{env=\"$env\"}, pool)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "sort": 1,
+        "current": {}
+      },
+      {
+        "name": "backend",
+        "label": "Backend",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+        "query": "label_values(agentgate_gateway_requests_total{env=\"$env\",pool=~\"$pool\"}, backend)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "sort": 1,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "SLO status",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Availability error budget remaining (28d)",
+      "description": "Fraction of the 99.9% availability budget still unspent. At zero, the error-budget policy freezes non-essential gateway deploys.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.25 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "agentgate:gateway_availability:error_budget_remaining_ratio{env=\"$env\"}",
+          "legendFormat": "budget remaining",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Request rate",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 5, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 1,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum(rate(agentgate_gateway_requests_total{env=\"$env\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "requests/s",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Failure ratio (5m)",
+      "description": "5xx plus no_healthy_backend over total. 4xx is excluded: a caller sending an oversized prompt is not the platform failing.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 10, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.001 },
+              { "color": "red", "value": 0.01344 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "agentgate:gateway_availability:error_ratio_rate5m{env=\"$env\"}",
+          "legendFormat": "failure ratio",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "Gateway overhead p95 (objective < 60ms)",
+      "description": "Gateway time excluding provider time — what the platform is accountable for.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 15, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.045 },
+              { "color": "red", "value": 0.06 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "agentgate:gateway_overhead:p95_1m{env=\"$env\"}",
+          "legendFormat": "p95 overhead",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 5,
+      "title": "Streaming TTFT p95 (objective < 1200ms)",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.9 },
+              { "color": "red", "value": 1.2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "agentgate:gateway_ttft:p95_1m{env=\"$env\"}",
+          "legendFormat": "p95 TTFT",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 101,
+      "title": "Traffic and errors",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 10,
+      "title": "Request rate by status",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "stacking": { "mode": "normal", "group": "A" },
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "5.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (status) (rate(agentgate_gateway_requests_total{env=\"$env\",pool=~\"$pool\",backend=~\"$backend\"}[$__rate_interval]))",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 11,
+      "title": "Error rate by stable error code",
+      "description": "The `code` values are the frozen contract from SPEC §2.4, so this panel is comparable across releases.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "stacking": { "mode": "normal", "group": "A" },
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (code) (rate(agentgate_gateway_requests_total{env=\"$env\",pool=~\"$pool\",code!=\"\"}[$__rate_interval]))",
+          "legendFormat": "{{code}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 102,
+      "title": "Latency",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 20,
+      "title": "Gateway overhead p50 / p95 / p99 by pool",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.06 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "histogram_quantile(0.50, sum by (pool, le) (rate(agentgate_gateway_overhead_seconds_bucket{env=\"$env\",pool=~\"$pool\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{pool}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (pool, le) (rate(agentgate_gateway_overhead_seconds_bucket{env=\"$env\",pool=~\"$pool\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{pool}}"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (pool, le) (rate(agentgate_gateway_overhead_seconds_bucket{env=\"$env\",pool=~\"$pool\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{pool}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 21,
+      "title": "Time to first token p95 by backend",
+      "description": "Split by backend because a failover to the on-prem tier shows up here first, before it shows up anywhere else.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1.2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "agentgate:gateway_ttft:p95_5m_by_backend{env=\"$env\",pool=~\"$pool\",backend=~\"$backend\"}",
+          "legendFormat": "{{backend}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 103,
+      "title": "Saturation and resilience",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 30,
+      "title": "In-flight requests by pool",
+      "description": "Load shedding starts when this crosses the configured ceiling; batch priority is shed before interactive.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 25 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "stacking": { "mode": "normal", "group": "A" },
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (pool) (agentgate_gateway_inflight{env=\"$env\",pool=~\"$pool\"})",
+          "legendFormat": "{{pool}}"
+        }
+      ]
+    },
+    {
+      "type": "state-timeline",
+      "id": 31,
+      "title": "Circuit breaker state by backend",
+      "description": "3-state breaker per SPEC §3.3. Sustained open on every backend in a pool is what produces 503 no_healthy_backend.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 25 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 0, "fillOpacity": 80 },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "inactive", "color": "text", "index": 0 },
+                "1": { "text": "active", "color": "red", "index": 1 }
+              }
+            }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "alignValue": "center",
+        "rowHeight": 0.9,
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "max by (backend) (agentgate_breaker_state{env=\"$env\",backend=~\"$backend\",state=\"open\"})",
+          "legendFormat": "{{backend}} open"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 32,
+      "title": "Retry ratio vs 10% fleet budget",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 25 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.075 },
+              { "color": "red", "value": 0.1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "agentgate:retry_ratio:rate5m{env=\"$env\"}",
+          "legendFormat": "fleet retry ratio"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "agentgate:retry_ratio:rate5m_by_backend{env=\"$env\",backend=~\"$backend\"}",
+          "legendFormat": "{{backend}}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 104,
+      "title": "Policy chain",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 40,
+      "title": "Cache lookups by result",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 33 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "stacking": { "mode": "normal", "group": "A" },
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (result) (rate(agentgate_cache_lookups_total{env=\"$env\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 41,
+      "title": "Guardrail decisions by action",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 33 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "stacking": { "mode": "normal", "group": "A" },
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (action, category) (rate(agentgate_guardrail_decisions_total{env=\"$env\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{action}} / {{category}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 42,
+      "title": "Rate-limit and quota decisions",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 33 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "stacking": { "mode": "normal", "group": "A" },
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (decision) (rate(agentgate_ratelimit_decisions_total{env=\"$env\"}[$__rate_interval]))",
+          "legendFormat": "{{decision}}"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 50,
+      "title": "Agents with the highest failure rate (5m)",
+      "description": "Who is actually affected. During a provider incident this is the list the platform team communicates to.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 40 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "filterable": true },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.05 }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value" },
+            "properties": [{ "id": "displayName", "value": "failure ratio" }]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" },
+        "sortBy": [{ "displayName": "failure ratio", "desc": true }]
+      },
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true } } }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "topk(20, sum by (tenant, team, agent) (rate(agentgate_gateway_requests_total{env=\"$env\",status=~\"5..\"}[5m])) / clamp_min(sum by (tenant, team, agent) (rate(agentgate_gateway_requests_total{env=\"$env\"}[5m])), 1e-9))"
+        }
+      ]
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  }
+}

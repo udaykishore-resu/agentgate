@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentgate-common
+  namespace: agentgate
+data:
+  AGENTGATE_ENV: "dev"
+  AGENTGATE_LOG_LEVEL: "debug"
+  # Non-prod default per SPEC §4.2. Content still passes through the guardrail
+  # redactor and still lands on the separate, access-controlled content
+  # pipeline — `redacted` changes what is captured, never where it goes.
+  AGENTGATE_CAPTURE_CONTENT: "redacted"
+  # Availability over strictness in dev: a guardrail restart must not block
+  # development. Note this cannot be set for pools whose data classification is
+  # `restricted`; those declare fail_closed in the pool config and the pool
+  # setting wins.
+  AGENTGATE_GUARDRAIL_FAILURE_MODE: "fail_open"
+  AGENTGATE_OIDC_ISSUER: "https://controlplane.dev.agentgate.internal"
+  AGENTGATE_OIDC_JWKS_URL: "https://controlplane.dev.agentgate.internal/.well-known/jwks.json"
+  AGENTGATE_VAULT_ADDR: "https://agentgate-kv-dev.vault.azure.net"
+  AGENTGATE_CLUSTER_NAME: "aks-agentgate-dev"
+  # ServiceNow integration off in dev: the promotion gate falls back to the
+  # documented manual path, which is exactly what needs testing here.
+  AGENTGATE_SERVICENOW_URL: ""

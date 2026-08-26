@@ -1,0 +1,211 @@
+# AgentGate — Alertmanager routing.
+#
+# Two destinations, and the difference between them is the only thing that
+# keeps paging credible:
+#   notify=page   -> PagerDuty, wakes the on-call. Reserved for user-visible
+#                    harm or imminent user-visible harm.
+#   notify=ticket -> ServiceNow, appears in the queue. Everything else.
+#
+# The `notify` label is set explicitly on every rule in
+# rules/slo.rules.yml and rules/operational.rules.yml rather than being derived
+# from `severity`, so that changing where an alert goes is a one-line, reviewed
+# change on the alert itself.
+
+global:
+  resolve_timeout: 5m
+  smtp_from: "agentgate-alerts@client.example"
+  smtp_smarthost: "smtp.client.example:587"
+  smtp_require_tls: true
+  # Secrets are mounted as files by the External Secrets operator; never inline.
+  smtp_auth_username: "agentgate-alerts@client.example"
+  smtp_auth_password_file: /etc/alertmanager/secrets/smtp-password
+
+templates:
+  - /etc/alertmanager/templates/*.tmpl
+
+route:
+  receiver: platform-ticket
+
+  # Group by the dimensions a responder actually triages on. Deliberately NOT
+  # by `agent`: during a provider outage thousands of agents fail at once and
+  # grouping by agent would produce thousands of pages for one incident.
+  group_by: [alertname, env, service, region]
+
+  # 30s to let a burst coalesce; 5m between updates to the same group; 4h
+  # before re-notifying an unchanged firing group, which is long enough not to
+  # be noise and short enough that a forgotten incident resurfaces within a
+  # shift.
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    # Non-production alerts never page, whatever their severity. A staging
+    # outage at 03:00 is a Monday-morning problem.
+    - matchers:
+        - env=~"dev|staging"
+      receiver: platform-ticket
+      group_wait: 2m
+      repeat_interval: 24h
+      continue: false
+
+    - matchers:
+        - notify="page"
+      receiver: platform-page
+      group_wait: 15s
+      group_interval: 2m
+      repeat_interval: 1h
+      routes:
+        # Safety and PKI failures also go to the security queue in parallel,
+        # because the follow-up is a control review, not just a fix.
+        - matchers:
+            - component=~"safety|pki"
+          receiver: platform-page-and-security
+          continue: false
+
+    # Cost alerts reach the owning team as well as the platform: the platform
+    # cannot fix an agent that started sending 10x the prompt size.
+    - matchers:
+        - component="cost"
+      receiver: cost-owners
+      group_by: [alertname, env, cost_center, team]
+      group_wait: 5m
+      repeat_interval: 12h
+
+    - matchers:
+        - notify="ticket"
+      receiver: platform-ticket
+
+inhibit_rules:
+  # A pool with every backend open-circuit is the cause of the individual
+  # breaker alerts underneath it. Show the cause, not the symptoms.
+  - source_matchers:
+      - alertname="PoolAllBackendsOpen"
+    target_matchers:
+      - alertname="BackendCircuitBreakerOpen"
+    equal: [env, pool]
+
+  # A tripped breaker is the cause of that backend's degradation alerts.
+  - source_matchers:
+      - alertname="BackendCircuitBreakerOpen"
+    target_matchers:
+      - alertname=~"ProviderDegraded|ProviderLatencyDegraded"
+    equal: [env, backend]
+
+  # If the gateway is not being scraped at all, do not also emit the SLO alerts
+  # that are computed from its (now absent) metrics.
+  - source_matchers:
+      - alertname="AgentGateTargetDown"
+      - job="agentgate-gateway"
+    target_matchers:
+      - service="gateway"
+    equal: [env]
+
+  - source_matchers:
+      - alertname="GatewayMetricsStale"
+    target_matchers:
+      - slo=~"gateway_availability|gateway_latency|gateway_ttft"
+    equal: [env]
+
+  # Fast burn implies slow burn implies the ticket-level burn. Keep only the
+  # most urgent one per SLO so the responder sees one alert, not three.
+  - source_matchers:
+      - severity="critical"
+      - burn_window="1h"
+    target_matchers:
+      - burn_window=~"6h|3d"
+    equal: [env, slo]
+
+  - source_matchers:
+      - severity="critical"
+      - burn_window="6h"
+    target_matchers:
+      - burn_window="3d"
+    equal: [env, slo]
+
+  # A collector that is dropping data explains degraded per-agent completeness.
+  - source_matchers:
+      - alertname="TelemetryCollectorDroppingData"
+    target_matchers:
+      - alertname=~"TelemetryDegradedForAgent|TelemetryCompletenessSLOBreached"
+    equal: [env]
+
+  # Generic severity ladder for anything not covered above.
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity="warning"
+    equal: [alertname, env, service]
+
+receivers:
+  - name: platform-page
+    pagerduty_configs:
+      - routing_key_file: /etc/alertmanager/secrets/pagerduty-routing-key
+        severity: "{{ if eq .CommonLabels.severity \"critical\" }}critical{{ else }}warning{{ end }}"
+        description: '{{ template "agentgate.title" . }}'
+        client: AgentGate Alertmanager
+        client_url: "https://grafana.agentgate.internal/alerting/list"
+        details:
+          env: "{{ .CommonLabels.env }}"
+          service: "{{ .CommonLabels.service }}"
+          slo: "{{ .CommonLabels.slo }}"
+          runbook: "{{ (index .Alerts 0).Annotations.runbook_url }}"
+          dashboard: "{{ (index .Alerts 0).Annotations.dashboard_url }}"
+          summary: "{{ (index .Alerts 0).Annotations.summary }}"
+          description: "{{ (index .Alerts 0).Annotations.description }}"
+
+  - name: platform-page-and-security
+    pagerduty_configs:
+      - routing_key_file: /etc/alertmanager/secrets/pagerduty-routing-key
+        severity: critical
+        description: '{{ template "agentgate.title" . }}'
+        client: AgentGate Alertmanager
+        client_url: "https://grafana.agentgate.internal/alerting/list"
+        details:
+          runbook: "{{ (index .Alerts 0).Annotations.runbook_url }}"
+          summary: "{{ (index .Alerts 0).Annotations.summary }}"
+    email_configs:
+      - to: "security-operations@client.example"
+        send_resolved: true
+        headers:
+          Subject: '[AgentGate][{{ .CommonLabels.env }}] {{ template "agentgate.title" . }}'
+
+  - name: platform-ticket
+    webhook_configs:
+      # ServiceNow event ingestion. The same integration the promotion gate
+      # uses for change records (SPEC §1.4), so alerts and changes correlate in
+      # one system rather than two.
+      - url: "https://client.service-now.com/api/global/em/jsonv2"
+        send_resolved: true
+        max_alerts: 50
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /etc/alertmanager/secrets/servicenow-token
+
+  - name: cost-owners
+    email_configs:
+      - to: "finops@client.example"
+        send_resolved: true
+        headers:
+          Subject: '[AgentGate][cost][{{ .CommonLabels.env }}] {{ .CommonLabels.cost_center }} — {{ template "agentgate.title" . }}'
+    webhook_configs:
+      - url: "https://client.service-now.com/api/global/em/jsonv2"
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /etc/alertmanager/secrets/servicenow-token
+
+  # Explicit black hole, referenced by silences and by the dev/staging
+  # override during planned load tests.
+  - name: "null"
+
+time_intervals:
+  - name: business-hours-uk
+    time_intervals:
+      - weekdays: ["monday:friday"]
+        times:
+          - start_time: "08:00"
+            end_time: "18:00"
+        location: Europe/London

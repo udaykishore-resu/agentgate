@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector-gateway
+  namespace: agentgate
+spec:
+  template:
+    spec:
+      containers:
+        - name: collector
+          env:
+            # 20%: high enough that a soak test produces a usable sample of
+            # normal behaviour, low enough that a week-long test does not fill
+            # the shared non-prod trace store. Errors, guardrail blocks,
+            # failovers and slow requests are still kept at 100% by policy.
+            - name: TAIL_SAMPLING_BASELINE_PERCENT
+              value: "20"
+            - name: TRACES_OTLP_ENDPOINT
+              value: "langfuse-otlp.observability.svc.cluster.local:4317"
+            - name: CONTENT_OTLP_ENDPOINT
+              value: "content-store-otlp.observability-restricted.svc.cluster.local:4317"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 2Gi

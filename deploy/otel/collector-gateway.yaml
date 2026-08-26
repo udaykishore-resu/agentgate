@@ -1,0 +1,370 @@
+# AgentGate — OpenTelemetry Collector, GATEWAY TIER (SPEC §4.4, second hop).
+#
+# Runs as an HA Deployment behind a headless Service. Receives only from the
+# agent tier, which uses a trace-ID-aware loadbalancing exporter, so every span
+# of a trace arrives at ONE instance here. That property is what makes tail
+# sampling and per-trace routing correct rather than approximately correct.
+#
+# This tier makes the fleet-wide decisions:
+#   * ownership is stamped and corrected, so nobody can misreport who pays;
+#   * content is separated onto its own access-controlled path and scrubbed
+#     off the general path;
+#   * cost is summed BEFORE sampling, so chargeback stays exact even though
+#     only ~5% of traces are stored;
+#   * tail sampling keeps everything that matters and 5% of what does not.
+#
+# See deploy/otel/README.md for what each processor is for and what breaks if
+# it is removed.
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 127.0.0.1:1777
+  zpages:
+    endpoint: 127.0.0.1:55679
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 32
+        # A single agent-tier connection must not be able to monopolise this
+        # instance; ageing connections out also lets the headless Service
+        # rebalance when the tier scales.
+        keepalive:
+          server_parameters:
+            max_connection_age: 300s
+            max_connection_age_grace: 60s
+      http:
+        endpoint: 0.0.0.0:4318
+
+  prometheus/self:
+    config:
+      scrape_configs:
+        - job_name: otel-collector-gateway
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["127.0.0.1:8888"]
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  # ---------------------------------------------------------------------
+  # Ownership: stamp and correct (SPEC §4.1)
+  # ---------------------------------------------------------------------
+  # Cheap, unconditional stamps. `upsert` (not `insert`) for the tier marker so
+  # a replayed or re-ingested payload cannot claim to have skipped this hop.
+  attributes/ownership:
+    actions:
+      - key: agentgate.telemetry.tier
+        value: gateway
+        action: upsert
+      - key: deployment.environment.name
+        value: ${env:AGENTGATE_ENV}
+        action: insert
+
+  # The conditional half. An agent's self-declared ownership annotations are
+  # hints; the gateway writes the verified values from the token onto the span.
+  # Where the two disagree, the token wins and the disagreement is made visible
+  # instead of being quietly resolved — that flag is what turns "our chargeback
+  # numbers look wrong" into a fixable list of agents.
+  transform/attribution:
+    error_mode: ignore
+    trace_statements:
+      - context: resource
+        statements:
+          # Declared-vs-verified mismatch on the chargeback key.
+          - >-
+            set(attributes["agentgate.attribution.corrected"], true)
+            where attributes["agentgate.cost_center.declared"] != nil
+            and attributes["agentgate.cost_center"] != nil
+            and attributes["agentgate.cost_center.declared"] != attributes["agentgate.cost_center"]
+          # No verified cost centre at all: bucket it explicitly rather than
+          # letting the series vanish, so unattributed spend is countable.
+          - >-
+            set(attributes["agentgate.cost_center"], "UNATTRIBUTED")
+            where attributes["agentgate.cost_center"] == nil
+          - >-
+            set(attributes["agentgate.attribution.corrected"], true)
+            where attributes["agentgate.cost_center"] == "UNATTRIBUTED"
+          - >-
+            set(attributes["agentgate.attribution.corrected"], false)
+            where attributes["agentgate.attribution.corrected"] == nil
+          # The declared hints have served their purpose; dropping them keeps
+          # storage and label cardinality down.
+          - delete_key(attributes, "agentgate.cost_center.declared")
+          - delete_key(attributes, "agentgate.owner.email.declared")
+
+  # ---------------------------------------------------------------------
+  # Redaction (SPEC §4.2 — content never reaches the general path)
+  # ---------------------------------------------------------------------
+  # Value-level masking of anything that looks like a financial or personal
+  # identifier, applied to span and log ATTRIBUTES. This is defence in depth:
+  # the guardrail engine redacts content before it is emitted, and this catches
+  # the case where an SDK or a provider error message carries an identifier in
+  # an attribute nobody thought about.
+  redaction/pii:
+    allow_all_keys: true
+    blocked_values:
+      # Payment card numbers (13–19 digits, optionally separated).
+      - '\b(?:\d[ -]*?){13,19}\b'
+      # IBAN.
+      - '\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b'
+      # US SSN.
+      - '\b\d{3}-\d{2}-\d{4}\b'
+      # Email addresses appearing in free text (owner.email is an allowed,
+      # structured attribute and is matched by key below, not by value).
+      - '\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'
+      # Bearer tokens / JWTs that leak into error strings.
+      - '\bey[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b'
+    ignored_keys:
+      # Structured ownership fields are meant to contain these shapes.
+      - agentgate.owner.email
+      - agentgate.agent.identity
+      - agentgate.tenant.id
+      - agentgate.team.id
+      - agentgate.cost_center
+    # `info` records how many values were masked without recording the values.
+    summary: info
+
+  # Removes prompt/completion span events from the general trace path. Content
+  # travels only on the content pipeline below, which has its own backend,
+  # retention and access control.
+  filter/drop-content-events:
+    error_mode: ignore
+    traces:
+      spanevent:
+        - 'name == "gen_ai.content.prompt"'
+        - 'name == "gen_ai.content.completion"'
+
+  # The mirror image: on the content path, keep the content events and nothing
+  # else that could duplicate the general path's storage.
+  filter/content-only:
+    error_mode: ignore
+    traces:
+      span:
+        - 'not IsMatch(name, "^gen_ai\\.(chat|embeddings)$")'
+
+  # ---------------------------------------------------------------------
+  # Tail sampling (SPEC §4.4 — exact policy set)
+  # ---------------------------------------------------------------------
+  # Policies are OR-ed: a trace is kept if ANY policy votes to keep it.
+  # decision_wait must exceed the p99 end-to-end trace duration, otherwise slow
+  # traces are decided on while still incomplete and the "keep everything over
+  # p99" policy never fires for the traces it exists to catch.
+  tail_sampling:
+    decision_wait: 12s
+    num_traces: 200000
+    expected_new_traces_per_sec: 4000
+    policies:
+      # 100% of errors.
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      # 100% of guardrail blocks and redactions — the audit trail a regulated
+      # client is actually asked for.
+      - name: guardrail-blocks
+        type: string_attribute
+        string_attribute:
+          key: agentgate.guardrail
+          values: ["^blocked:.*", "^redacted:.*"]
+          enabled_regex_matching: true
+      # 100% of failovers. These are rare, and they are the only evidence of
+      # how the resilience layer behaved during a provider incident.
+      - name: failovers
+        type: ottl_condition
+        ottl_condition:
+          error_mode: ignore
+          span:
+            - 'attributes["agentgate.failover.from"] != nil'
+      # 100% of requests slower than p99. Tail sampling cannot compute a
+      # rolling percentile, so the threshold is pinned from the SLO instead:
+      # p95 TTFT objective is 1200ms (SPEC §5), and 3s is the observed p99 of
+      # unary requests. Review this number when the SLO changes.
+      - name: slow-requests
+        type: latency
+        latency:
+          threshold_ms: 3000
+      # 5% of everything else, so normal behaviour is still describable.
+      # Overridden per environment: 100 in dev, 20 in staging, 5 in prod.
+      - name: baseline
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: ${env:TAIL_SAMPLING_BASELINE_PERCENT}
+
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 5s
+
+  # Content batches are smaller: the payloads are far larger per span, and the
+  # content backend is the one place where a 32 MiB export would hurt.
+  batch/content:
+    send_batch_size: 128
+    send_batch_max_size: 256
+    timeout: 5s
+
+connectors:
+  # Routes by resource: the gateway emits content spans under a resource
+  # carrying agentgate.signal=content (a dedicated tracer provider), so the
+  # split is a single attribute check rather than a per-span heuristic.
+  routing:
+    default_pipelines: [traces/main]
+    error_mode: ignore
+    table:
+      - context: resource
+        condition: attributes["agentgate.signal"] == "content"
+        pipelines: [traces/content]
+
+  # Cost aggregation. Sums the per-request agentgate.cost.usd span attribute
+  # into a metric keyed by the chargeback dimensions.
+  #
+  # This runs on the INGEST pipeline, before tail_sampling, on purpose: cost is
+  # a billing fact and must be complete. Summing after sampling would report
+  # roughly 5% of the fleet's spend and be wrong in a way nobody notices until
+  # month end.
+  sum:
+    spans:
+      agentgate.gateway.cost_usd:
+        source_attribute: agentgate.cost.usd
+        conditions:
+          - 'attributes["agentgate.cost.usd"] != nil'
+        attributes:
+          - key: agentgate.tenant.id
+          - key: agentgate.team.id
+          - key: agentgate.cost_center
+            default_value: UNATTRIBUTED
+          - key: agentgate.backend
+          - key: agentgate.pool
+          - key: deployment.environment.name
+
+exporters:
+  # Trace store: Langfuse or the self-hosted OTLP store (Jaeger/Tempo locally).
+  otlp/traces:
+    endpoint: ${env:TRACES_OTLP_ENDPOINT}
+    tls:
+      insecure: true
+    timeout: 15s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 8192
+
+  # Separate exporter, separate destination, separate credentials. Content is
+  # a different data classification from telemetry and must not share a
+  # retention policy or an RBAC grant with it. In cloud environments this
+  # endpoint is a distinct project/workspace whose access list is reviewed
+  # under the data-residency review in SPEC §8.
+  otlp/content:
+    endpoint: ${env:CONTENT_OTLP_ENDPOINT}
+    tls:
+      insecure: true
+    headers:
+      x-agentgate-pipeline: content
+    timeout: 20s
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 120s
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      # Deliberately small: if the content backend is down, drop content
+      # rather than build a large in-memory buffer of sensitive material.
+      queue_size: 512
+
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    enable_open_metrics: true
+    # Off on purpose. Turning every resource attribute into a label would add
+    # k8s.pod.name and container.image.tag to every series — an unbounded
+    # cardinality explosion on every deploy. The gateway already emits the
+    # ownership labels listed in SPEC §4.3 as metric attributes.
+    resource_to_telemetry_conversion:
+      enabled: false
+    # Long enough that a 30s scrape never misses a slow-moving gauge, short
+    # enough that a deleted agent's series stop being published.
+    metric_expiration: 5m
+
+  otlphttp/loki:
+    endpoint: ${env:LOKI_ENDPOINT}
+    tls:
+      insecure: true
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 120s
+    sending_queue:
+      enabled: true
+      queue_size: 4096
+
+  # Chargeback landing file (SPEC §4.4 "cost → chargeback exporter"). Locally
+  # this is the append-only file the warehouse loader reads; in cloud
+  # environments the overlay swaps this exporter for `kafka` pointed at Event
+  # Hubs (Azure) or MSK/Kinesis (AWS) — same pipeline, same attributes.
+  file/chargeback:
+    path: /tmp/agentgate-chargeback.jsonl
+    format: json
+    rotation:
+      max_megabytes: 64
+      max_days: 3
+      max_backups: 5
+
+service:
+  extensions: [health_check, pprof, zpages]
+  telemetry:
+    logs:
+      level: info
+      encoding: json
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    # Everything lands here first. Ownership is settled and identifiers are
+    # masked before any fan-out, so no downstream path can receive an
+    # unattributed or unredacted span.
+    traces/ingest:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/ownership, transform/attribution, redaction/pii]
+      exporters: [routing, sum]
+
+    traces/main:
+      receivers: [routing]
+      processors: [filter/drop-content-events, tail_sampling, batch]
+      exporters: [otlp/traces]
+
+    # Non-sampled and access-controlled, per SPEC §4.4.
+    traces/content:
+      receivers: [routing]
+      processors: [filter/content-only, batch/content]
+      exporters: [otlp/content]
+
+    metrics:
+      receivers: [otlp, prometheus/self]
+      processors: [memory_limiter, attributes/ownership, batch]
+      exporters: [prometheus]
+
+    metrics/cost:
+      receivers: [sum]
+      processors: [batch]
+      exporters: [prometheus, file/chargeback]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/ownership, redaction/pii, batch]
+      exporters: [otlphttp/loki]

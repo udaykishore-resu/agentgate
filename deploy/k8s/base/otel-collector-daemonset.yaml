@@ -1,0 +1,139 @@
+# Agent-tier collector — one per node (SPEC §4.4, first hop).
+#
+# A DaemonSet rather than a Deployment because the value of this tier is that
+# it is *node-local*: emitting processes reach it without leaving the node, and
+# it can attach pod metadata while the pod still exists. A Deployment would add
+# a network hop to the hot path and would lose the k8sattributes scoping that
+# keeps API-server load proportional to the cluster.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector-agent
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: telemetry-agent
+    app.kubernetes.io/part-of: agentgate
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+      app.kubernetes.io/component: telemetry-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # 10% at a time: during a collector rollout the node's emitters buffer
+      # locally, and taking a large fraction of nodes at once turns a routine
+      # upgrade into a telemetry gap.
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: otel-collector
+        app.kubernetes.io/component: telemetry-agent
+        app.kubernetes.io/part-of: agentgate
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8888"
+    spec:
+      serviceAccountName: otel-collector
+      # Required: the k8sattributes processor calls the API server.
+      automountServiceAccountToken: true
+      priorityClassName: system-node-critical
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Must run everywhere, including nodes tainted for specialised workloads
+      # — a node whose telemetry silently does not leave is worse than a node
+      # that does not run workloads.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector-contrib:0.115.1
+          args: ["--config=/etc/otel/collector-agent.yaml"]
+          ports:
+            # hostPort is what makes `status.hostIP:4317` a valid endpoint for
+            # every pod on the node. It is bound to the node's IP rather than
+            # to 0.0.0.0 in the NetworkPolicy sense — reachability is still
+            # restricted by the policy in networkpolicy.yaml.
+            - name: otlp-grpc
+              containerPort: 4317
+              hostPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              hostPort: 4318
+              protocol: TCP
+            - name: metrics
+              containerPort: 8888
+              protocol: TCP
+          env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: K8S_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: OTEL_GATEWAY_HOST
+              value: otel-collector-gateway-headless.agentgate.svc.cluster.local
+            # Feeds resourcedetection's `env` detector.
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "k8s.cluster.name=$(K8S_CLUSTER_NAME),service.namespace=agentgate"
+            - name: K8S_CLUSTER_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: agentgate-common
+                  key: AGENTGATE_CLUSTER_NAME
+                  optional: true
+            - name: AGENTGATE_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: agentgate-common
+                  key: AGENTGATE_ENV
+            - name: GOMEMLIMIT
+              value: "700MiB"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              # memory_limiter is configured as a percentage of this limit
+              # (80% soft / 20% spike), so changing this value changes the
+              # back-pressure threshold with it. That coupling is intentional.
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            periodSeconds: 10
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-agent
+            items:
+              - key: collector-agent.yaml
+                path: collector-agent.yaml

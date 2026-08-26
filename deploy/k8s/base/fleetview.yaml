@@ -1,0 +1,357 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fleetview
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: fleetview
+    app.kubernetes.io/component: truth-plane
+    app.kubernetes.io/part-of: agentgate
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fleetview
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fleetview
+        app.kubernetes.io/component: truth-plane
+        app.kubernetes.io/part-of: agentgate
+        azure.workload.identity/use: "true"
+      annotations:
+        agentgate.io/team: "platform-ai"
+        agentgate.io/cost-center: "CC-0001"
+        agentgate.io/owner-email: "platform-ai@client.example"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9092"
+    spec:
+      serviceAccountName: fleetview
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: fleetview
+      containers:
+        - name: fleetview
+          image: ghcr.io/agentgate/fleetview:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8082
+              protocol: TCP
+            - name: metrics
+              containerPort: 9092
+              protocol: TCP
+          env:
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: AGENTGATE_OTLP_ENDPOINT
+              value: "$(NODE_IP):4317"
+            - name: AGENTGATE_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: fleetview-secrets
+                  key: AGENTGATE_DB_DSN
+            - name: GOMEMLIMIT
+              value: "1750MiB"
+          envFrom:
+            - configMapRef:
+                name: agentgate-common
+          resources:
+            requests:
+              cpu: 300m
+              # The telemetry-trust computation (SPEC §4.5) holds a per-agent
+              # working set every 60s; memory scales with fleet size, not with
+              # request rate.
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fleetview
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: fleetview
+    app.kubernetes.io/part-of: agentgate
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: fleetview
+  ports:
+    - name: http
+      port: 8082
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 9092
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fleetview
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: fleetview
+    app.kubernetes.io/part-of: agentgate
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fleetview
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: guardrails
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: guardrails
+    app.kubernetes.io/component: traffic-plane
+    app.kubernetes.io/part-of: agentgate
+spec:
+  # Sized against the gateway, not against fleet size: every request makes at
+  # least one input call and streaming responses make one per ~256-token
+  # window, so guardrail QPS is a multiple of gateway QPS.
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: guardrails
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: guardrails
+        app.kubernetes.io/component: traffic-plane
+        app.kubernetes.io/part-of: agentgate
+        azure.workload.identity/use: "true"
+      annotations:
+        agentgate.io/team: "platform-ai"
+        agentgate.io/cost-center: "CC-0001"
+        agentgate.io/owner-email: "platform-ai@client.example"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8083"
+    spec:
+      serviceAccountName: guardrails
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: guardrails
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: guardrails
+      containers:
+        - name: guardrails
+          image: ghcr.io/agentgate/guardrails:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8083
+              protocol: TCP
+          env:
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: AGENTGATE_OTLP_ENDPOINT
+              value: "$(NODE_IP):4317"
+            # `callout` in cloud environments: the built-in regex/entropy
+            # detector is the local-development implementation, not the one
+            # the security review approved.
+            - name: AGENTGATE_GUARDRAIL_MODE
+              value: "callout"
+            - name: GOMEMLIMIT
+              value: "450MiB"
+          envFrom:
+            - configMapRef:
+                name: agentgate-common
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 15
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: guardrails
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: guardrails
+    app.kubernetes.io/part-of: agentgate
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: guardrails
+  ports:
+    - name: http
+      port: 8083
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: guardrails
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: guardrails
+    app.kubernetes.io/part-of: agentgate
+spec:
+  # Guardrail unavailability makes fail_open pools serve unscanned traffic and
+  # fail_closed pools return 403. Both are bad in different ways, so the budget
+  # is expressed as a floor rather than a ceiling.
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: guardrails
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: guardrails
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: guardrails
+    app.kubernetes.io/part-of: agentgate
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: guardrails
+  minReplicas: 3
+  maxReplicas: 24
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 120
+      selectPolicy: Min

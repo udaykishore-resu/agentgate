@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentgate-common
+  namespace: agentgate
+data:
+  AGENTGATE_ENV: "prod"
+  AGENTGATE_LOG_LEVEL: "info"
+  # SPEC §4.2: financial-services default is `off` in prod. Enabling this in
+  # production requires a named, time-boxed exception with a data-flow review,
+  # because it changes which systems hold customer content.
+  AGENTGATE_CAPTURE_CONTENT: "off"
+  # Inverts the non-prod trade-off: if the content-safety service cannot
+  # answer, the request fails rather than being served unscanned.
+  AGENTGATE_GUARDRAIL_FAILURE_MODE: "fail_closed"
+  AGENTGATE_OIDC_ISSUER: "https://controlplane.agentgate.internal"
+  AGENTGATE_OIDC_JWKS_URL: "https://controlplane.agentgate.internal/.well-known/jwks.json"
+  AGENTGATE_VAULT_ADDR: "https://agentgate-kv-prod.vault.azure.net"
+  AGENTGATE_CLUSTER_NAME: "aks-agentgate-prod"
+  AGENTGATE_SERVICENOW_URL: "https://client.service-now.com/api/now/table/change_request"

@@ -1,0 +1,33 @@
+{{/*
+AgentGate notification templates.
+
+One title format everywhere so a page, a ticket and an email about the same
+incident are recognisably the same incident.
+*/}}
+
+{{ define "agentgate.title" -}}
+[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}]
+{{- with .CommonLabels.env }} [{{ . }}]{{ end }}
+{{- with .CommonLabels.service }} {{ . }}:{{ end }}
+{{- " " }}{{ .CommonLabels.alertname }}
+{{- end }}
+
+{{ define "agentgate.text" -}}
+{{ range .Alerts -}}
+Alert:     {{ .Labels.alertname }} ({{ .Labels.severity }})
+Env:       {{ .Labels.env }}{{ with .Labels.region }} / {{ . }}{{ end }}
+Service:   {{ .Labels.service }}
+{{ with .Labels.slo }}SLO:       {{ . }}{{ with $.CommonLabels.burn_window }} (burn window {{ . }}){{ end }}
+{{ end -}}
+Summary:   {{ .Annotations.summary }}
+
+{{ .Annotations.description }}
+
+Runbook:   {{ .Annotations.runbook_url }}
+{{ with .Annotations.dashboard_url }}Dashboard: {{ . }}
+{{ end }}Started:   {{ .StartsAt.Format "2006-01-02T15:04:05Z07:00" }}
+Labels:    {{ range .Labels.SortedPairs }}{{ .Name }}={{ .Value }} {{ end }}
+
+---
+{{ end }}
+{{- end }}

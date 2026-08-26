@@ -1,0 +1,63 @@
+# Build context is the repo root; keep it small so `docker build` uploads fast
+# and so no local credential or state file can ever be baked into a layer.
+#
+# Used via: docker build -f deploy/docker/Dockerfile .
+# BuildKit picks up deploy/docker/Dockerfile.dockerignore or, for classic
+# builds, the root .dockerignore; the Makefile passes
+# DOCKER_BUILDKIT=1 so this file applies.
+
+# VCS
+.git
+.gitignore
+.github
+.gitattributes
+
+# Local tool + editor state
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# Build output — never ship a host-built binary into the image
+bin/
+dist/
+out/
+coverage.out
+coverage.html
+*.test
+*.prof
+
+# Everything the build does not need. Go source under cmd/ and internal/ is
+# required; docs, deploy manifests and diagrams are not.
+docs/
+deploy/k8s/
+deploy/terraform/
+deploy/grafana/
+deploy/prometheus/
+deploy/otel/
+deploy/compose/
+*.md
+!go.mod
+!go.sum
+
+# Local state produced by `make run-stack`
+.data/
+.env
+.env.*
+!.env.example
+*.local.yaml
+usage-*.jsonl
+
+# Secrets — belt and braces. Nothing matching these should exist in the repo,
+# and if it ever does it must not reach a layer.
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+kubeconfig
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example

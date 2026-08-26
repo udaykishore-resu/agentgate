@@ -1,0 +1,134 @@
+name: ci
+
+# The pipeline is ordered by how fast a failure is useful. Formatting and vet
+# fail in seconds; the race detector and the compose smoke test cost minutes and
+# run once the cheap checks have passed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24"
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # Dependencies are vendored, so there is nothing to cache and nothing
+          # to download. See docs/adr/0014-dependency-policy.md.
+          cache: false
+
+      - name: Verify the vendor directory is consistent with go.mod
+        run: go mod verify && go build -mod=vendor ./...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l . | grep -v '^vendor/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Unit and integration tests
+        run: go test -count=1 ./...
+
+      - name: Race detector
+        run: go test -race -count=1 ./...
+
+      - name: Coverage
+        run: |
+          go test -coverprofile=coverage.out -covermode=atomic ./internal/... > /dev/null
+          go tool cover -func=coverage.out | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  config:
+    name: configuration and manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Validate every shipped gateway configuration
+        # A configuration that only fails at deploy time has simply deferred an
+        # outage. Both shipped configurations are checked on every commit.
+        run: |
+          go run ./cmd/gateway -config config/gateway.yaml -validate
+          go run ./cmd/gateway -config deploy/compose/agentgate.local.yaml -validate
+
+      - name: Validate compose
+        run: docker compose config --quiet
+
+      - name: Validate Prometheus rules
+        run: |
+          docker run --rm -v "$PWD/deploy/prometheus:/rules" \
+            --entrypoint promtool prom/prometheus:v3.0.1 \
+            check rules /rules/rules/slo.rules.yml /rules/rules/operational.rules.yml
+
+      - name: Validate OpenTelemetry collector configs
+        run: |
+          for f in deploy/otel/collector-agent.yaml deploy/otel/collector-gateway.yaml; do
+            docker run --rm -v "$PWD/$f:/etc/otel/config.yaml" \
+              otel/opentelemetry-collector-contrib:0.115.1 validate --config=/etc/otel/config.yaml
+          done
+
+      - name: Validate Kubernetes overlays
+        run: |
+          curl -sSL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.5.0/kustomize_v5.5.0_linux_amd64.tar.gz | tar xz
+          for env in dev staging prod; do
+            ./kustomize build "deploy/k8s/overlays/$env" > /dev/null
+          done
+
+      - name: Validate OpenAPI documents
+        run: |
+          npx --yes @redocly/cli@1.25.11 lint api/openapi/*.yaml --format=stylish
+
+  smoke:
+    name: end-to-end smoke
+    runs-on: ubuntu-latest
+    needs: [build, config]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Bring the stack up
+        run: make run-stack
+
+      - name: Drive a request through the whole platform
+        run: make smoke
+
+      - name: Prove capacity at a small scale
+        # Not the capacity proof — that is test/load — but enough to catch a
+        # regression that only appears under concurrency.
+        run: DURATION=20s RATE=25 CONCURRENCY=10 make load
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=200
+
+      - name: Tear down
+        if: always()
+        run: make stop-stack

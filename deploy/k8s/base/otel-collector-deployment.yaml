@@ -1,0 +1,262 @@
+# Gateway-tier collector — HA pool (SPEC §4.4, second hop).
+#
+# Deployment, not DaemonSet: this tier must see whole traces from the whole
+# fleet to tail-sample them, and it is the only place content is handled. The
+# agent tier routes to it by trace ID through a headless Service, so the pod
+# set has to be discoverable by DNS with per-pod A records.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector-gateway
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: telemetry-gateway
+    app.kubernetes.io/part-of: agentgate
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      # Every restart loses the in-memory traces the instance was holding for a
+      # sampling decision, so replacements come up before old pods go away.
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+      app.kubernetes.io/component: telemetry-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: otel-collector
+        app.kubernetes.io/component: telemetry-gateway
+        app.kubernetes.io/part-of: agentgate
+        azure.workload.identity/use: "true"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8888"
+    spec:
+      serviceAccountName: otel-collector
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/component: telemetry-gateway
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/component: telemetry-gateway
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector-contrib:0.115.1
+          args: ["--config=/etc/otel/collector-gateway.yaml"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+            - name: metrics
+              containerPort: 8888
+              protocol: TCP
+            - name: prom-export
+              containerPort: 8889
+              protocol: TCP
+          env:
+            - name: AGENTGATE_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: agentgate-common
+                  key: AGENTGATE_ENV
+            - name: TRACES_OTLP_ENDPOINT
+              value: "langfuse-otlp.observability.svc.cluster.local:4317"
+            # Distinct destination with its own access control and retention.
+            # Content must not share a backend with general telemetry.
+            - name: CONTENT_OTLP_ENDPOINT
+              value: "content-store-otlp.observability-restricted.svc.cluster.local:4317"
+            - name: LOKI_ENDPOINT
+              value: "http://loki-gateway.observability.svc.cluster.local:3100/otlp"
+            # Overridden per environment: 100 dev, 20 staging, 5 prod.
+            - name: TAIL_SAMPLING_BASELINE_PERCENT
+              value: "5"
+            - name: GOMEMLIMIT
+              value: "3400MiB"
+          resources:
+            requests:
+              cpu: "1"
+              # tail_sampling holds up to num_traces (200k) in memory until a
+              # decision is made; this tier is memory-shaped, not CPU-shaped.
+              memory: 2Gi
+            limits:
+              memory: 4Gi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Longer than tail_sampling's 12s decision_wait so in-flight
+              # traces are decided and exported rather than dropped.
+              sleep:
+                seconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-gateway
+            items:
+              - key: collector-gateway.yaml
+                path: collector-gateway.yaml
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+# Headless Service: the loadbalancing exporter's DNS resolver needs one A
+# record per pod so it can hash trace IDs across the real pod set. A normal
+# ClusterIP Service would resolve to a single virtual IP and every trace would
+# land wherever kube-proxy chose, breaking tail sampling.
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector-gateway-headless
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: telemetry-gateway
+    app.kubernetes.io/part-of: agentgate
+spec:
+  clusterIP: None
+  # Include pods that are not yet Ready so the resolver's view of the pod set
+  # changes once, on scale, rather than twice.
+  publishNotReadyAddresses: false
+  selector:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: telemetry-gateway
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+      protocol: TCP
+---
+# Normal Service for scraping and for anything that just needs "a collector".
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector-gateway
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: telemetry-gateway
+    app.kubernetes.io/part-of: agentgate
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: telemetry-gateway
+  ports:
+    - name: metrics
+      port: 8888
+      targetPort: metrics
+      protocol: TCP
+    - name: prom-export
+      port: 8889
+      targetPort: prom-export
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: otel-collector-gateway
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/part-of: agentgate
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+      app.kubernetes.io/component: telemetry-gateway
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: otel-collector-gateway
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/part-of: agentgate
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: otel-collector-gateway
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      # Very slow. Every scale-down event re-shards the trace-ID hash ring in
+      # the agent tier, and traces in flight across the boundary are split
+      # between old and new owners — which is exactly the fragmentation tail
+      # sampling exists to avoid.
+      stabilizationWindowSeconds: 900
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 600
+      selectPolicy: Min

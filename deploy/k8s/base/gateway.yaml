@@ -1,0 +1,290 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: traffic-plane
+    app.kubernetes.io/part-of: agentgate
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  # The gateway carries streaming responses that can run for minutes, so a
+  # rollout must never remove capacity: surge first, then drain.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway
+        app.kubernetes.io/component: traffic-plane
+        app.kubernetes.io/part-of: agentgate
+        # Required by the Azure workload identity webhook to inject the
+        # projected token; harmless on EKS.
+        azure.workload.identity/use: "true"
+      annotations:
+        # Ownership hints consumed by the k8sattributes processor. The gateway
+        # itself is an agent-gate tenant like any other, and its own telemetry
+        # has to be attributable too.
+        agentgate.io/team: "platform-ai"
+        agentgate.io/cost-center: "CC-0001"
+        agentgate.io/owner-email: "platform-ai@client.example"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: gateway
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread across zones first (best effort — a zone outage must not block
+      # scheduling), then hard-spread across nodes so a single node loss cannot
+      # take a majority of replicas.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: gateway
+      containers:
+        - name: gateway
+          image: ghcr.io/agentgate/gateway:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: AGENTGATE_CONFIG
+              value: /etc/agentgate/agentgate.yaml
+            # Node-local collector. Using the host IP rather than a Service
+            # keeps telemetry on the node and removes a kube-proxy hop from
+            # the hot path.
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: AGENTGATE_OTLP_ENDPOINT
+              value: "$(NODE_IP):4317"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AGENTGATE_REDIS_ADDR
+              value: "agentgate-redis.privatelink.redis.cache.windows.net:6380"
+            - name: AGENTGATE_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: AGENTGATE_REDIS_PASSWORD
+            - name: AGENTGATE_USAGE_STREAM_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: AGENTGATE_USAGE_STREAM_DSN
+            # GOMEMLIMIT at ~85% of the memory limit makes the Go GC work
+            # harder as it approaches the cgroup ceiling instead of being
+            # OOMKilled mid-stream.
+            - name: GOMEMLIMIT
+              value: "1750MiB"
+            - name: GOMAXPROCS
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.cpu
+                  divisor: "1"
+          envFrom:
+            - configMapRef:
+                name: agentgate-common
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              # Memory is limited; CPU deliberately is not. A CFS quota on a
+              # latency-sensitive proxy produces throttling that shows up as
+              # p99 gateway overhead with no other symptom, and the whole
+              # latency SLO is about overhead. The ResourceQuota and the HPA
+              # bound total consumption instead.
+              memory: 2Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            # /readyz reports dependency health (Redis, control plane, at least
+            # one healthy backend). A pod that cannot serve is removed from the
+            # Service rather than returning 503 to callers.
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Endpoint removal is eventually consistent: keep serving for
+              # 10s after SIGTERM is scheduled so no request is routed to a
+              # pod that has already closed its listener.
+              sleep:
+                seconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/agentgate
+              readOnly: true
+            - name: pki
+              mountPath: /etc/agentgate/pki
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: gateway-config
+        - name: pki
+          secret:
+            secretName: gateway-secrets
+            items:
+              - key: onprem-ca.pem
+                path: onprem-ca.pem
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: agentgate
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+  # Long-lived streaming connections benefit from client affinity being off:
+  # affinity would pin a caller to one pod and defeat the HPA. Session
+  # correlation is done with the trace id, not the connection.
+  sessionAffinity: None
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: agentgate
+spec:
+  # Expressed as maxUnavailable so the budget stays correct as the HPA changes
+  # the replica count. A node drain takes one pod at a time; a cluster upgrade
+  # cannot empty the traffic plane.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: agentgate
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gateway
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+    # The metric that actually matters. Gateway pods spend most of their time
+    # waiting on providers, so CPU stays low while concurrency — and therefore
+    # latency and shedding risk — climbs. Scaling on in-flight requests is what
+    # keeps the gateway ahead of the load-shedding ceiling of 512 per pod.
+    # Requires prometheus-adapter (or KEDA) publishing
+    # agentgate_gateway_inflight as a Pods metric.
+    - type: Pods
+      pods:
+        metric:
+          name: agentgate_gateway_inflight
+        target:
+          type: AverageValue
+          averageValue: "200"
+  behavior:
+    scaleUp:
+      # Agent traffic arrives in steps, not ramps — a batch job starting can
+      # double load in seconds. Scale up immediately and aggressively.
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      # Slow and cautious: a five-minute window avoids flapping between
+      # bursts, and removing a pod cancels the streams it is carrying.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+      selectPolicy: Min

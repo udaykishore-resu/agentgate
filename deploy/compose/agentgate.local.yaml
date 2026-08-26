@@ -1,0 +1,259 @@
+# AgentGate gateway configuration — LOCAL STACK ONLY.
+#
+# Mounted at /etc/agentgate/agentgate.yaml and selected with AGENTGATE_CONFIG.
+# The schema is the one in internal/config; `agentgate-gateway -validate` checks
+# a file against it without starting the server.
+#
+# The three mockprovider instances in docker-compose.yml stand in for the three
+# real backend families in SPEC section 3.1 — a cloud-hosted model, a
+# third-party model, and on-premises inference — with deliberately different
+# latency and failure profiles, so routing, failover and the circuit breaker are
+# exercised locally instead of only in staging.
+
+env: dev
+
+service:
+  name: agentgate-gateway
+  http_addr: ":8080"
+  metrics_addr: ":9090"
+  read_timeout: 30s
+  # No write timeout: a streamed generation legitimately runs for minutes and
+  # the per-request deadline governs instead.
+  write_timeout: 0
+  idle_timeout: 120s
+  shutdown_timeout: 25s
+  log_level: "${AGENTGATE_LOG_LEVEL:-info}"
+
+telemetry:
+  otlp_endpoint: "http://otel-agent:4318"
+  otlp_insecure: true
+  namespace: agentgate
+  # Head sampling stays at 1.0. The sampling decision that matters is made by
+  # tail_sampling in the gateway-tier collector, which needs complete traces to
+  # make it.
+  sample_ratio: 1.0
+  batch_size: 512
+  batch_timeout: 5s
+  # SPEC section 4.2: content capture is off in production, redacted below it.
+  content_capture: redacted
+
+identity:
+  issuer: "http://controlplane:8081"
+  audience: "https://gateway.agentgate.internal"
+  jwks_url: "http://controlplane:8081/.well-known/jwks.json"
+  jwks_refresh: 5m
+  jwks_max_stale: 24h
+  clock_skew: 60s
+  # Set to true only to demonstrate the gateway with no control plane running.
+  # Configuration validation refuses it outside dev.
+  allow_unverified: false
+
+redis:
+  addr: "redis:6379"
+  pool_size: 64
+  dial_timeout: 2s
+  read_timeout: 500ms
+
+gateway:
+  request_timeout: 60s
+  stream_timeout: 10m
+  stream_heartbeat: 15s
+  stream_stall_after: 30s
+  max_body_bytes: 8388608
+  max_concurrent: 256
+  # A fifth of capacity is reserved for interactive traffic, so a batch job
+  # cannot starve a person waiting for an answer.
+  batch_reserve_ratio: 0.2
+  default_max_tokens: 1024
+  idempotency_ttl: 24h
+  rate_limiter: redis
+  retry:
+    max_attempts: 3
+    base_delay: 100ms
+    max_delay: 2s
+    budget_ratio: 0.25
+    fleet_budget_ratio: 0.1
+    fleet_window: 10s
+  breaker:
+    window_size: 50
+    failure_ratio: 0.5
+    consecutive_failures: 10
+    minimum_requests: 10
+    open_duration: 30s
+    half_open_probes: 5
+  default_quota:
+    requests_per_minute: 600
+    tokens_per_minute: 120000
+    monthly_token_budget: 900000000
+
+cache:
+  max_bytes: 134217728
+
+chargeback:
+  enabled: true
+  dir: /var/lib/agentgate/usage
+  queue_size: 8192
+  anomaly_alpha: 0.3
+  anomaly_sigmas: 3
+
+models:
+  - name: general-chat
+    pool: general-chat
+    context_window: 128000
+    max_output_tokens: 4096
+    capabilities: [chat, streaming, tools, json_mode]
+    description: Default conversational model for agent reasoning steps.
+  - name: long-context
+    pool: long-context
+    context_window: 200000
+    max_output_tokens: 8192
+    capabilities: [chat, streaming, tools]
+    description: For document-heavy prompts that do not fit the default window.
+  - name: text-embedding
+    pool: embeddings
+    context_window: 8191
+    capabilities: [embeddings]
+    description: Embeddings for retrieval and semantic cache candidates.
+
+pools:
+  - name: general-chat
+    strategy: weighted_least_loaded
+    tier: interactive
+    cache:
+      enabled: true
+      ttl: 15m
+      max_temperature: 0.2
+      # A tool call is an instruction to act; replaying one from cache can mean
+      # the action silently does not happen.
+      allow_tools: false
+      semantic: false
+      semantic_threshold: 0.97
+    guardrail:
+      enabled: true
+      provider: callout
+      url: "http://guardrails:8083/v1/inspect"
+      # This pool has a backend cleared for restricted data, so it fails
+      # closed: if the content filter cannot answer, nothing is sent. See
+      # docs/adr/0010-fail-closed-guardrails-for-restricted-data.md.
+      failure_mode: fail_closed
+      timeout: 1500ms
+      scan_output: true
+      output_window_tokens: 256
+      categories:
+        hate: {action: block, threshold: 0.5}
+        self_harm: {action: block, threshold: 0.3}
+        sexual: {action: block, threshold: 0.5}
+        violence: {action: block, threshold: 0.5}
+        pii: {action: redact, threshold: 0}
+        secrets: {action: block, threshold: 0}
+        prompt_injection: {action: annotate, threshold: 0.7}
+    backends:
+      # Fast and reliable: the weighted primary.
+      - name: azure-openai/gpt-4o-mini
+        kind: azure-openai
+        base_url: "http://mockprovider-azure:8090"
+        model: gpt-4o-mini
+        deployment: gpt-4o-mini
+        api_version: "2024-10-21"
+        api_key: "env:AZURE_OPENAI_API_KEY"
+        weight: 60
+        priority: 1
+        timeout: 60s
+        max_concurrent: 128
+        max_classification: restricted
+        residency: eu-west
+        input_cost_per_1m: 0.15
+        output_cost_per_1m: 0.60
+        cost_source: "list price 2026-06"
+      # Slower and noticeably flakier: makes retry budget and failover visible.
+      - name: bedrock/claude-haiku
+        kind: bedrock
+        region: eu-west-1
+        base_url: "http://mockprovider-bedrock:8090"
+        model: anthropic.claude-3-5-haiku-20241022-v1:0
+        weight: 40
+        priority: 1
+        timeout: 60s
+        max_concurrent: 96
+        # A third-party path is not cleared for restricted data; the router
+        # enforces that rather than a wiki page.
+        max_classification: confidential
+        residency: eu-west
+        input_cost_per_1m: 0.25
+        output_cost_per_1m: 1.25
+        cost_source: "negotiated rate card 2026-04"
+      # Slow but very reliable: the priority-2 on-premises failover tier.
+      - name: onprem-vllm/llama-3.1-8b
+        kind: onprem-vllm
+        base_url: "http://mockprovider-vllm:8090"
+        model: meta-llama/Llama-3.1-8B-Instruct
+        weight: 100
+        priority: 2
+        timeout: 90s
+        max_concurrent: 64
+        max_classification: restricted
+        residency: on-premises
+        # Internal cost model rather than a price list: on-premises inference
+        # still consumes capacity somebody paid for.
+        input_cost_per_1m: 0.04
+        output_cost_per_1m: 0.04
+        cost_source: "internal GPU cost model FY26"
+
+  - name: long-context
+    strategy: priority
+    tier: interactive
+    cache:
+      enabled: false
+    guardrail:
+      enabled: true
+      provider: callout
+      url: "http://guardrails:8083/v1/inspect"
+      # A pool that carries whole documents is the one most likely to carry
+      # restricted material, so it fails closed.
+      failure_mode: fail_closed
+      timeout: 2s
+      scan_output: true
+      output_window_tokens: 512
+    backends:
+      - name: azure-openai/gpt-4o
+        kind: azure-openai
+        base_url: "http://mockprovider-azure:8090"
+        model: gpt-4o
+        deployment: gpt-4o
+        api_version: "2024-10-21"
+        api_key: "env:AZURE_OPENAI_API_KEY"
+        priority: 1
+        timeout: 180s
+        max_concurrent: 32
+        max_classification: restricted
+        input_cost_per_1m: 2.50
+        output_cost_per_1m: 10.00
+        cost_source: "list price 2026-06"
+
+  - name: embeddings
+    strategy: round_robin
+    tier: batch
+    cache:
+      enabled: true
+      ttl: 1h
+      max_temperature: 1.0
+    guardrail:
+      enabled: false
+      provider: noop
+      failure_mode: fail_open
+    backends:
+      - name: azure-openai/text-embedding-3-small
+        kind: azure-openai
+        base_url: "http://mockprovider-azure:8090"
+        model: text-embedding-3-small
+        deployment: text-embedding-3-small
+        api_version: "2024-10-21"
+        api_key: "env:AZURE_OPENAI_API_KEY"
+        priority: 1
+        timeout: 30s
+        max_concurrent: 64
+        capabilities: [embeddings]
+        max_classification: confidential
+        input_cost_per_1m: 0.02
+        output_cost_per_1m: 0.0
+        cost_source: "list price 2026-06"

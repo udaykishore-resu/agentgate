@@ -1,0 +1,19 @@
+apiVersion: 1
+
+providers:
+  - name: agentgate
+    orgId: 1
+    folder: AgentGate
+    folderUid: agentgate
+    type: file
+    # Dashboards are provisioned from the repo, so an edit made in the UI is
+    # overwritten on the next reload. That is deliberate: a dashboard someone
+    # relied on during an incident must be reproducible from git.
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      # Mirrors the directory layout into Grafana folders if subdirectories are
+      # added later.
+      foldersFromFilesStructure: false

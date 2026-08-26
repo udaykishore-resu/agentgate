@@ -1,0 +1,84 @@
+# Ingress equivalent of httproute.yaml, for clusters without Gateway API.
+#
+# NOT referenced by kustomization.yaml. Apply one or the other, never both:
+# two controllers programming the same hostnames produce split-brain routing
+# that is invisible until a request lands on the wrong path.
+#
+# To use it, in the overlay:
+#   resources:
+#     - ../../base/ingress-alternative.yaml
+#   patches:
+#     - target: {kind: HTTPRoute}
+#       patch: |
+#         $patch: delete
+#         apiVersion: gateway.networking.k8s.io/v1
+#         kind: HTTPRoute
+#         metadata: {name: gateway, namespace: agentgate}
+#
+# The annotations below are ingress-nginx specific. That is the cost of
+# Ingress: the two behaviours AgentGate actually needs — unlimited streaming
+# timeouts and no proxy-level retries — are not part of the Ingress API and
+# have to be expressed per controller.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agentgate
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/part-of: agentgate
+  annotations:
+    # Streaming: no read/send timeout, and buffering off so tokens reach the
+    # caller as they are produced rather than in proxy-sized chunks. With
+    # buffering on, time-to-first-token is measured by the proxy's buffer size,
+    # not by the model.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    # The gateway owns retries and the fleet-wide retry budget; a proxy retry
+    # would bypass it and double-charge the caller's token quota.
+    nginx.ingress.kubernetes.io/proxy-next-upstream: "off"
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    cert-manager.io/cluster-issuer: enterprise-pki
+spec:
+  ingressClassName: nginx-internal
+  tls:
+    - hosts:
+        - gateway.agentgate.internal
+        - controlplane.agentgate.internal
+        - fleet.agentgate.internal
+      secretName: agentgate-internal-tls
+  rules:
+    - host: gateway.agentgate.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 8080
+    - host: controlplane.agentgate.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: controlplane
+                port:
+                  number: 8081
+    - host: fleet.agentgate.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: fleetview
+                port:
+                  number: 8082

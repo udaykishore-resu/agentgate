@@ -1,0 +1,242 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controlplane
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/component: trust-plane
+    app.kubernetes.io/part-of: agentgate
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: controlplane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: controlplane
+        app.kubernetes.io/component: trust-plane
+        app.kubernetes.io/part-of: agentgate
+        azure.workload.identity/use: "true"
+      annotations:
+        agentgate.io/team: "platform-ai"
+        agentgate.io/cost-center: "CC-0001"
+        agentgate.io/owner-email: "platform-ai@client.example"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        # Forces a rollout when the signing key rotates, because the process
+        # reads it at start. The External Secrets Operator updates the
+        # annotation's source Secret; Reloader (or `kubectl rollout restart`
+        # from the rotation job) does the rest.
+        reloader.stakater.com/auto: "true"
+    spec:
+      serviceAccountName: controlplane
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: controlplane
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: controlplane
+      containers:
+        - name: controlplane
+          image: ghcr.io/agentgate/controlplane:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+              protocol: TCP
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          env:
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: AGENTGATE_OTLP_ENDPOINT
+              value: "$(NODE_IP):4317"
+            - name: AGENTGATE_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: controlplane-secrets
+                  key: AGENTGATE_DB_DSN
+            - name: AGENTGATE_SERVICENOW_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: controlplane-secrets
+                  key: AGENTGATE_SERVICENOW_TOKEN
+            # The private key never appears in an env var — only its path. It
+            # is projected read-only from the vault-backed Secret and is
+            # mounted on a tmpfs so it is never written to node disk.
+            - name: AGENTGATE_SIGNING_KEY_PATH
+              value: /etc/agentgate/keys/signing.pem
+            - name: GOMEMLIMIT
+              value: "900MiB"
+          envFrom:
+            - configMapRef:
+                name: agentgate-common
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: signing-key
+              mountPath: /etc/agentgate/keys
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: signing-key
+          secret:
+            secretName: controlplane-secrets
+            defaultMode: 0400
+            items:
+              - key: signing.pem
+                path: signing.pem
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: controlplane
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/part-of: agentgate
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: controlplane
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 9091
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: controlplane
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/part-of: agentgate
+spec:
+  # At two replicas this pins the control plane to one voluntary disruption at
+  # a time. Token exchange has a 99.95% objective; a drain that took both
+  # replicas would spend a third of the monthly budget in one go.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: controlplane
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: controlplane
+  namespace: agentgate
+  labels:
+    app.kubernetes.io/name: controlplane
+    app.kubernetes.io/part-of: agentgate
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: controlplane
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # Token exchange is CPU-bound (signature generation), but a fleet-wide
+    # restart produces a burst of concurrent exchanges that CPU averaging
+    # reacts to too slowly.
+    - type: Pods
+      pods:
+        metric:
+          name: agentgate_controlplane_inflight
+        target:
+          type: AverageValue
+          averageValue: "50"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+      selectPolicy: Min

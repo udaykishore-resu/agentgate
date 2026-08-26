@@ -1,0 +1,34 @@
+# Build output
+/bin/
+/dist/
+*.test
+*.out
+
+# Local runtime state. The file-backed registry, secret store and usage journal
+# are development conveniences; production uses Postgres, a vault and the usage
+# stream. Nothing here should ever be committed.
+/data/
+/deploy/compose/keys/*.pem
+/deploy/compose/alertmanager-secrets/*
+!/deploy/compose/alertmanager-secrets/README.md
+
+# Environment-specific Terraform inputs and state. Values differ per
+# environment and several of them are secrets.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+/deploy/terraform/*/env/
+/deploy/terraform/*/backends/
+*.auto.tfvars
+!terraform.tfvars.example
+
+# Load-test artefacts
+/test/load/results/
+*.k6.json
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp

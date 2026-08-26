@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentgate-common
+  namespace: agentgate
+data:
+  AGENTGATE_ENV: "staging"
+  AGENTGATE_LOG_LEVEL: "info"
+  # Non-prod default (SPEC §4.2). The promotion gate's guardrail evidence is
+  # reviewed from redacted staging content, so turning this off would remove
+  # the material a `guardrail_clean` decision is made from.
+  AGENTGATE_CAPTURE_CONTENT: "redacted"
+  AGENTGATE_GUARDRAIL_FAILURE_MODE: "fail_open"
+  AGENTGATE_OIDC_ISSUER: "https://controlplane.stg.agentgate.internal"
+  AGENTGATE_OIDC_JWKS_URL: "https://controlplane.stg.agentgate.internal/.well-known/jwks.json"
+  AGENTGATE_VAULT_ADDR: "https://agentgate-kv-stg.vault.azure.net"
+  AGENTGATE_CLUSTER_NAME: "aks-agentgate-stg"
+  # ServiceNow is live in staging: the promotion path to prod is itself the
+  # thing being rehearsed, and a change payload that has never been generated
+  # is a change payload that will fail on the night.
+  AGENTGATE_SERVICENOW_URL: "https://client-stg.service-now.com/api/now/table/change_request"

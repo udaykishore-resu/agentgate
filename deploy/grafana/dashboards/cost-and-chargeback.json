@@ -1,0 +1,524 @@
+{
+  "uid": "agentgate-cost-chargeback",
+  "title": "AgentGate — Cost and Chargeback",
+  "description": "Spend attributed to cost centres, teams and agents, plus what the platform saved through caching. Numbers here are derived from the same UsageRecord stream that produces the monthly export (SPEC §6), so a figure disputed on this dashboard can be reconciled line by line.",
+  "tags": ["agentgate", "cost", "finops"],
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5m",
+  "time": { "from": "now-7d", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "label": "Environment",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+        "query": "label_values(agentgate_gateway_cost_usd_total, env)",
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "sort": 1,
+        "current": {}
+      },
+      {
+        "name": "cost_center",
+        "label": "Cost centre",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+        "query": "label_values(agentgate_gateway_cost_usd_total{env=\"$env\"}, cost_center)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "sort": 1,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "Spend at a glance",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Spend, last 24h",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum(increase(agentgate_gateway_cost_usd_total{env=\"$env\",cost_center=~\"$cost_center\"}[24h]))",
+          "legendFormat": "24h spend"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Month to date",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 5, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum(increase(agentgate_gateway_cost_usd_total{env=\"$env\",cost_center=~\"$cost_center\"}[30d]))",
+          "legendFormat": "30d spend"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Cache savings, last 24h",
+      "description": "Cached hits are recorded billable:false with a savings figure (SPEC §6). This is how a shared platform demonstrates it is cheaper than everyone integrating directly.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 10, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum(increase(agentgate_gateway_cache_savings_usd_total{env=\"$env\",cost_center=~\"$cost_center\"}[24h]))",
+          "legendFormat": "saved"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "Cost per 1k requests",
+      "description": "The unit-economics number. A rise here with flat traffic means prompts grew, retries grew, or routing shifted to a more expensive backend.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 5, "x": 15, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 3,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "1000 * sum(rate(agentgate_gateway_cost_usd_total{env=\"$env\",cost_center=~\"$cost_center\"}[6h])) / clamp_min(sum(rate(agentgate_gateway_requests_total{env=\"$env\"}[6h])), 1e-9)",
+          "legendFormat": "USD / 1k req"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 5,
+      "title": "Unattributed spend",
+      "description": "Traffic that reached the gateway with no verified cost centre. Must be zero before a month can be closed.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.001 },
+              { "color": "red", "value": 0.01 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum(rate(agentgate_gateway_cost_usd_total{env=\"$env\",cost_center=\"UNATTRIBUTED\"}[6h])) / clamp_min(sum(rate(agentgate_gateway_cost_usd_total{env=\"$env\"}[6h])), 1e-9)",
+          "legendFormat": "unattributed"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 101,
+      "title": "Attribution",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 10,
+      "title": "Spend rate by cost centre",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 30,
+            "stacking": { "mode": "normal", "group": "A" },
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (cost_center) (rate(agentgate_gateway_cost_usd_total{env=\"$env\",cost_center=~\"$cost_center\"}[$__rate_interval])) * 3600",
+          "legendFormat": "{{cost_center}} (USD/h)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 11,
+      "title": "Spend rate by backend",
+      "description": "Where the money physically goes. Compare against the request share on the golden-signals dashboard: a backend taking 10% of traffic and 60% of spend is a routing decision worth revisiting.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 30,
+            "stacking": { "mode": "normal", "group": "A" },
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (backend) (rate(agentgate_gateway_cost_usd_total{env=\"$env\",cost_center=~\"$cost_center\"}[$__rate_interval])) * 3600",
+          "legendFormat": "{{backend}} (USD/h)"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 102,
+      "title": "Anomalies and ceilings",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 16 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 20,
+      "title": "Daily spend vs cost-centre ceiling",
+      "description": "The hard backstop from SPEC §5. Breaching the ceiling pages, regardless of how gradually the spend grew.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 17 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "ceiling.*" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "agentgate:cost_usd:daily_by_cost_center{env=\"$env\",cost_center=~\"$cost_center\"}",
+          "legendFormat": "{{cost_center}} 24h"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "agentgate_cost_center_daily_ceiling_usd{env=\"$env\",cost_center=~\"$cost_center\"}",
+          "legendFormat": "ceiling {{cost_center}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 21,
+      "title": "Agent hourly spend vs 3-sigma anomaly band",
+      "description": "The band is the 7-day rolling mean plus three standard deviations, the same expression the AgentCostAnomaly alert fires on.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 17 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "threshold.*" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["max"], "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "topk(10, agentgate:cost_usd_per_hour:by_agent{env=\"$env\",cost_center=~\"$cost_center\"})",
+          "legendFormat": "{{agent}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "topk(10, agentgate:cost_usd_per_hour:baseline_7d{env=\"$env\",cost_center=~\"$cost_center\"} + 3 * agentgate:cost_usd_per_hour:stddev_7d{env=\"$env\",cost_center=~\"$cost_center\"})",
+          "legendFormat": "threshold {{agent}}"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 30,
+      "title": "Chargeback table — 30 days by cost centre and team",
+      "description": "Matches the monthly export served at /api/v1/chargeback. If a team disputes a number, start here and drill into the UsageRecord stream.",
+      "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+      "gridPos": { "h": 11, "w": 24, "x": 0, "y": 26 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "filterable": true },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value #A" },
+            "properties": [{ "id": "displayName", "value": "billed USD (30d)" }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Value #B" },
+            "properties": [{ "id": "displayName", "value": "saved by cache USD (30d)" }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Value #C" },
+            "properties": [
+              { "id": "displayName", "value": "input tokens (30d)" },
+              { "id": "unit", "value": "short" },
+              { "id": "decimals", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Value #D" },
+            "properties": [
+              { "id": "displayName", "value": "output tokens (30d)" },
+              { "id": "unit", "value": "short" },
+              { "id": "decimals", "value": 0 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "footer": {
+          "show": true,
+          "reducer": ["sum"],
+          "countRows": false,
+          "fields": ["Value #A", "Value #B"]
+        },
+        "sortBy": [{ "displayName": "billed USD (30d)", "desc": true }]
+      },
+      "transformations": [
+        { "id": "joinByField", "options": { "byField": "cost_center", "mode": "outer" } },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "__name__": true,
+              "job": true,
+              "instance": true,
+              "env 2": true,
+              "env 3": true,
+              "env 4": true
+            }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (cost_center, team) (increase(agentgate_gateway_cost_usd_total{env=\"$env\",cost_center=~\"$cost_center\"}[30d]))"
+        },
+        {
+          "refId": "B",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (cost_center) (increase(agentgate_gateway_cache_savings_usd_total{env=\"$env\",cost_center=~\"$cost_center\"}[30d]))"
+        },
+        {
+          "refId": "C",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (cost_center) (increase(agentgate_gateway_tokens_total{env=\"$env\",direction=\"input\"}[30d]))"
+        },
+        {
+          "refId": "D",
+          "format": "table",
+          "instant": true,
+          "datasource": { "type": "prometheus", "uid": "agentgate-prometheus" },
+          "expr": "sum by (cost_center) (increase(agentgate_gateway_tokens_total{env=\"$env\",direction=\"output\"}[30d]))"
+        }
+      ]
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  }
+}

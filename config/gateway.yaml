@@ -1,0 +1,88 @@
+# AgentGate gateway — single-machine development configuration.
+#
+# This is the file `make run-gateway` uses. It assumes nothing is running
+# except one mockprovider on :8090, so an engineer can get a request through
+# the full policy chain within a minute of cloning the repository. Everything
+# it turns off is turned back on by deploy/compose/agentgate.local.yaml, and
+# configuration validation refuses these shortcuts outside dev.
+
+env: dev
+
+service:
+  name: agentgate-gateway
+  http_addr: ":8080"
+  metrics_addr: ":9090"
+  log_level: info
+  shutdown_timeout: 10s
+
+telemetry:
+  # Empty endpoint means spans are still created — so trace ids appear in logs
+  # and response headers — but nothing is exported.
+  otlp_endpoint: ""
+  namespace: agentgate
+  sample_ratio: 1.0
+  content_capture: redacted
+
+identity:
+  # No control plane on a laptop. Every caller is treated as a clearly-marked
+  # developer identity; see developerClaims in internal/gateway/policy.go.
+  allow_unverified: true
+
+gateway:
+  request_timeout: 60s
+  stream_heartbeat: 15s
+  max_concurrent: 64
+  rate_limiter: memory
+  default_quota:
+    requests_per_minute: 6000
+    tokens_per_minute: 2000000
+
+cache:
+  max_bytes: 33554432
+
+chargeback:
+  enabled: true
+  dir: ./data/usage
+
+models:
+  - name: general-chat
+    pool: general-chat
+    context_window: 128000
+    max_output_tokens: 4096
+    capabilities: [chat, streaming, tools, json_mode]
+  - name: text-embedding
+    pool: general-chat
+    context_window: 8191
+    capabilities: [embeddings]
+
+pools:
+  - name: general-chat
+    strategy: weighted_least_loaded
+    tier: interactive
+    cache:
+      enabled: true
+      ttl: 10m
+      max_temperature: 0.2
+    guardrail:
+      enabled: true
+      # The built-in detector needs no external service, so PII and credential
+      # detection work out of the box.
+      provider: builtin
+      # The local backend is cleared for restricted data, so the pool fails
+      # closed. Configuration validation refuses the alternative in production.
+      failure_mode: fail_closed
+      scan_output: true
+      output_window_tokens: 128
+    backends:
+      - name: local/mock-model-8b
+        kind: openai
+        base_url: "http://localhost:8090/v1"
+        model: mock-model-8b
+        weight: 100
+        priority: 1
+        timeout: 60s
+        max_concurrent: 32
+        max_classification: restricted
+        input_cost_per_1m: 0.10
+        output_cost_per_1m: 0.30
+        cost_source: "local development placeholder"

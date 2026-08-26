@@ -1,0 +1,148 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# prod — the environment the SLOs in SPEC §5 are measured against.
+#
+# What differs from the base, and why:
+#   replicas            6 gateway / 3 control plane, HPA ceilings raised.
+#   content capture     `off`. Financial-services default (SPEC §4.2): prompts
+#                       and completions from production agents are never
+#                       captured, not even redacted, without a specific
+#                       approved exception.
+#   guardrails          fail_closed. In prod, serving unscanned content is a
+#                       worse outcome than returning 503. This inverts the
+#                       non-prod trade-off deliberately.
+#   tail sampling       5% baseline (SPEC §4.4).
+#   image tag           immutable release tag, digest-pinned by the release job.
+#   scheduling          zone spread is DoNotSchedule, not ScheduleAnyway.
+#   priority            gateway and control plane run at cluster-critical
+#                       priority so they are not the first thing evicted.
+
+namespace: agentgate
+
+resources:
+  - ../../base
+  - priorityclass.yaml
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/environment: prod
+
+images:
+  - name: ghcr.io/agentgate/gateway
+    newTag: 1.0.0
+  - name: ghcr.io/agentgate/controlplane
+    newTag: 1.0.0
+  - name: ghcr.io/agentgate/fleetview
+    newTag: 1.0.0
+  - name: ghcr.io/agentgate/guardrails
+    newTag: 1.0.0
+
+replicas:
+  - name: gateway
+    count: 6
+  - name: controlplane
+    count: 3
+  - name: fleetview
+    count: 2
+  - name: guardrails
+    count: 6
+  - name: otel-collector-gateway
+    count: 4
+
+patches:
+  - path: common-config.yaml
+  - path: sampling.yaml
+  - path: scheduling.yaml
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: gateway
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 6
+      - op: replace
+        path: /spec/maxReplicas
+        value: 60
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: guardrails
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 6
+      - op: replace
+        path: /spec/maxReplicas
+        value: 48
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: controlplane
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 12
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: otel-collector-gateway
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 4
+      - op: replace
+        path: /spec/maxReplicas
+        value: 16
+
+  # At 6 replicas the budget can afford to be expressed as a fraction, which
+  # keeps a large cluster upgrade moving without ever dropping below 75%
+  # capacity.
+  - target:
+      kind: PodDisruptionBudget
+      name: gateway
+    patch: |-
+      - op: remove
+        path: /spec/maxUnavailable
+      - op: add
+        path: /spec/minAvailable
+        value: 75%
+  - target:
+      kind: PodDisruptionBudget
+      name: controlplane
+    patch: |-
+      - op: remove
+        path: /spec/maxUnavailable
+      - op: add
+        path: /spec/minAvailable
+        value: 2
+  - target:
+      kind: PodDisruptionBudget
+      name: guardrails
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 4
+
+  - target:
+      kind: SecretStore
+      name: azure-keyvault
+    patch: |-
+      - op: replace
+        path: /spec/provider/azurekv/vaultUrl
+        value: https://agentgate-kv-prod.vault.azure.net
+
+  # The AWS store is not deployed in the Azure production cluster. Leaving an
+  # unused SecretStore in place is a standing invitation to point a secret at
+  # the wrong cloud.
+  - target:
+      kind: SecretStore
+      name: aws-secretsmanager
+    patch: |-
+      $patch: delete
+      apiVersion: external-secrets.io/v1beta1
+      kind: SecretStore
+      metadata:
+        name: aws-secretsmanager

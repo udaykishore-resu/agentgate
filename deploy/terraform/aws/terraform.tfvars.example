@@ -1,0 +1,120 @@
+# Copy to terraform.tfvars (git-ignored) or, better, keep one file per
+# environment outside the repo:
+#
+#   terraform plan -var-file=../../../env/prod.aws.tfvars
+#
+# Values below are the production shape. dev and staging differ only in the
+# marked lines.
+
+account_id  = "000000000000"
+region      = "eu-west-1"
+environment = "prod" # dev | staging | prod
+name_prefix = "agentgate"
+
+tags = {
+  application         = "agentgate"
+  owner               = "platform-ai@client.example"
+  cost_center         = "CC-0001"
+  data_classification = "confidential"
+}
+
+# ---------------------------------------------------------------------------
+# Network — deliberately distinct from the Azure plan (10.60.0.0/16) so both
+# clouds can peer to the same on-prem estate without renumbering.
+# ---------------------------------------------------------------------------
+
+vpc_cidr           = "10.70.0.0/16"
+availability_zones = ["eu-west-1a", "eu-west-1b", "eu-west-1c"]
+
+subnet_newbits = {
+  app      = 4  # /20 per AZ — EKS nodes and pods
+  data     = 6  # /22 per AZ — RDS, ElastiCache
+  public   = 8  # /24 per AZ — NAT gateways only
+  firewall = 10 # /26 per AZ — Network Firewall endpoints
+}
+
+onprem_inference_cidr = "10.10.20.0/24"
+
+# Every addition here is a third-party risk review. A leading dot means "and
+# all subdomains" — Network Firewall syntax, not a typo.
+egress_allowed_fqdns = [
+  ".amazonaws.com",
+  "ghcr.io",
+  ".pkg.github.com",
+  "registry.k8s.io",
+  ".pkg.dev",
+  "client.service-now.com",
+]
+
+# ---------------------------------------------------------------------------
+# Compute
+# ---------------------------------------------------------------------------
+
+kubernetes_version = "1.31"
+
+node_groups = {
+  system = {
+    instance_types = ["m6i.xlarge"]
+    min_size       = 3
+    max_size       = 6
+    desired_size   = 3
+    capacity_type  = "ON_DEMAND"
+  }
+  workload = {
+    instance_types = ["r6i.xlarge"]
+    min_size       = 3  # dev: 1, staging: 2
+    max_size       = 30 # dev: 4, staging: 10
+    desired_size   = 3  # dev: 1, staging: 2
+    # On-demand, not spot: a reclaimed node cancels every stream its gateway
+    # pods are carrying, and the saving is small next to model spend.
+    capacity_type = "ON_DEMAND"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# State stores
+# ---------------------------------------------------------------------------
+
+rds = {
+  instance_class          = "db.m6g.xlarge" # dev: db.t4g.medium
+  allocated_storage       = 256
+  max_allocated_storage   = 1024
+  engine_version          = "16.6"
+  multi_az                = true # dev/staging: false
+  backup_retention_period = 35   # dev: 7
+  deletion_protection     = true # dev: false
+}
+
+elasticache = {
+  node_type          = "cache.m7g.large" # dev: cache.t4g.micro
+  num_cache_clusters = 2                 # dev: 1 (no automatic failover)
+  engine_version     = "7.1"
+}
+
+# ---------------------------------------------------------------------------
+# Models — this list is an IAM allowlist, not documentation. A pool that
+# references a model missing from here fails at the IAM boundary.
+# ---------------------------------------------------------------------------
+
+bedrock_model_ids = [
+  "anthropic.claude-3-5-haiku-20241022-v1:0",
+  "anthropic.claude-3-5-sonnet-20241022-v2:0",
+  "amazon.titan-embed-text-v2:0",
+]
+
+# ---------------------------------------------------------------------------
+# Edge
+# ---------------------------------------------------------------------------
+
+internal_domain = "agentgate.internal"
+
+# Enterprise private CA. These names never resolve publicly, so a public CA
+# could not validate them.
+acm_private_ca_arn = "arn:aws:acm-pca:eu-west-1:000000000000:certificate-authority/00000000-0000-0000-0000-000000000000"
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+
+log_retention_days  = 90 # dev: 30
+usage_stream_shards = 4  # dev/staging: 1 — 1000 records/s per shard

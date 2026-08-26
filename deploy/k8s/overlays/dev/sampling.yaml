@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector-gateway
+  namespace: agentgate
+spec:
+  template:
+    spec:
+      containers:
+        - name: collector
+          env:
+            # Keep everything. At dev volume the storage cost is negligible and
+            # the main use of the pipeline here is "show me the trace for the
+            # request I just made", which sampling defeats.
+            - name: TAIL_SAMPLING_BASELINE_PERCENT
+              value: "100"
+            # Dev traces go to the shared non-prod backend. Content goes to the
+            # non-prod content store, which has its own (still restricted)
+            # access list — dev content is redacted, not public.
+            - name: TRACES_OTLP_ENDPOINT
+              value: "langfuse-otlp.observability.svc.cluster.local:4317"
+            - name: CONTENT_OTLP_ENDPOINT
+              value: "content-store-otlp.observability-restricted.svc.cluster.local:4317"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              memory: 1Gi

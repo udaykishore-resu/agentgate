@@ -1,0 +1,129 @@
+# AgentGate — agent-tier collector, DOCKER COMPOSE VARIANT.
+#
+# Identical to collector-agent.yaml except that the `k8sattributes` processor
+# is removed: it authenticates to the Kubernetes API with a ServiceAccount
+# token and fails to start when there is no API server, which would take the
+# whole local stack down. Everything else — the ordering, the loadbalancing
+# exporter, the batch sizes — is kept the same on purpose, so a change made
+# for local debugging is a change that will also be exercised in a cluster.
+#
+# Keep this file in step with collector-agent.yaml when editing either.
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 127.0.0.1:1777
+  zpages:
+    endpoint: 127.0.0.1:55679
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 16
+      http:
+        endpoint: 0.0.0.0:4318
+
+  prometheus/self:
+    config:
+      scrape_configs:
+        - job_name: otel-collector-agent
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["127.0.0.1:8888"]
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  resourcedetection:
+    detectors: [env, system]
+    timeout: 5s
+    override: false
+    system:
+      hostname_sources: ["os"]
+
+  resource/environment:
+    attributes:
+      - key: deployment.environment.name
+        value: ${env:AGENTGATE_ENV}
+        action: insert
+      - key: agentgate.telemetry.tier
+        value: agent
+        action: upsert
+      - key: k8s.node.name
+        value: ${env:K8S_NODE_NAME}
+        action: insert
+
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 5s
+
+exporters:
+  loadbalancing:
+    routing_key: traceID
+    protocol:
+      otlp:
+        timeout: 10s
+        tls:
+          insecure: true
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 15s
+          max_elapsed_time: 120s
+        sending_queue:
+          enabled: true
+          num_consumers: 8
+          queue_size: 4096
+    resolver:
+      dns:
+        hostname: ${env:OTEL_GATEWAY_HOST}
+        port: 4317
+        interval: 30s
+
+  otlp/gateway:
+    endpoint: ${env:OTEL_GATEWAY_HOST}:4317
+    tls:
+      insecure: true
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 120s
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 2048
+
+service:
+  extensions: [health_check, pprof, zpages]
+  telemetry:
+    logs:
+      level: info
+      encoding: json
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, resource/environment, batch]
+      exporters: [loadbalancing]
+    metrics:
+      receivers: [otlp, prometheus/self]
+      processors: [memory_limiter, resourcedetection, resource/environment, batch]
+      exporters: [otlp/gateway]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, resource/environment, batch]
+      exporters: [otlp/gateway]
