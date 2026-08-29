@@ -138,6 +138,78 @@ validate: ## Validate compose, collector, Prometheus rules and kustomize output
 	done
 
 # ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+# `make run` is the thirty-second version of this repo: two Go processes, no
+# Docker, no Postgres, no Redis, no identity provider, no key material. It is
+# the shipped config/gateway.yaml, which turns every dependency off on purpose
+# (in-memory rate limiter, in-memory cache, builtin guardrails, and
+# identity.allow_unverified so callers need no token). `make run-stack` below
+# is the same gateway wired to the real thing.
+
+.PHONY: run
+run: ## Clean clone to a live gateway on :8080 — no Docker, no config, no keys
+	@command -v $(GO) >/dev/null 2>&1 || { echo "go is required: https://go.dev/dl/"; exit 1; }
+	@command -v curl >/dev/null 2>&1 || { echo "curl is required"; exit 1; }
+	@mkdir -p $(BIN_DIR)
+	@echo "building gateway and mockprovider (vendored deps, no network needed)"
+	@CGO_ENABLED=0 $(GO) build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/mockprovider ./cmd/mockprovider
+	@CGO_ENABLED=0 $(GO) build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/gateway ./cmd/gateway
+	@$(BIN_DIR)/mockprovider > $(BIN_DIR)/mockprovider.log 2>&1 & \
+		mock=$$!; \
+		$(BIN_DIR)/gateway -config config/gateway.yaml > $(BIN_DIR)/gateway.log 2>&1 & \
+		gw=$$!; \
+		trap 'kill $$mock $$gw 2>/dev/null; exit 0' INT TERM; \
+		trap 'kill $$mock $$gw 2>/dev/null' EXIT; \
+		ready=""; \
+		for _ in $$(seq 1 60); do \
+			if curl -sf -o /dev/null $(GATEWAY_URL)/healthz 2>/dev/null; then ready=yes; break; fi; \
+			sleep 0.25; \
+		done; \
+		echo; \
+		if [ -z "$$ready" ]; then echo "  gateway did not come up on $(GATEWAY_URL) — see $(BIN_DIR)/gateway.log"; exit 1; fi; \
+		echo "  gateway ready on $(GATEWAY_URL)   mock model backend on http://localhost:8090"; \
+		echo; \
+		echo "  in another terminal:"; \
+		echo; \
+		echo "    make demo          # runs the three requests below for you"; \
+		echo; \
+		echo "    curl -s $(GATEWAY_URL)/healthz"; \
+		echo "    curl -s $(GATEWAY_URL)/v1/models"; \
+		echo "    curl -s $(GATEWAY_URL)/v1/chat/completions -H 'content-type: application/json' \\"; \
+		echo "      -d '{\"model\":\"general-chat\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":32}'"; \
+		echo; \
+		echo "  no Authorization header is needed: identity.allow_unverified is on in config/gateway.yaml."; \
+		echo "  logs: $(BIN_DIR)/gateway.log and $(BIN_DIR)/mockprovider.log"; \
+		echo "  ctrl-c stops both processes. make run-stack brings up the full wired stack instead."; \
+		echo; \
+		wait $$gw
+
+.PHONY: demo
+demo: ## Drive a gateway started by `make run`: a normal call, a cache hit, a blocked secret
+	@command -v curl >/dev/null 2>&1 || { echo "curl is required"; exit 1; }
+	@curl -sf -o /dev/null $(GATEWAY_URL)/healthz 2>/dev/null || { \
+		echo "no gateway on $(GATEWAY_URL) — run 'make run' in another terminal first"; exit 1; }
+	@echo
+	@echo "1. a normal completion — note the x-agentgate-* headers describing the decision"
+	@curl -s -D - -o /dev/null $(GATEWAY_URL)/v1/chat/completions \
+		-H 'content-type: application/json' \
+		-d '{"model":"general-chat","messages":[{"role":"user","content":"what happened to this payment"}],"max_tokens":32}' \
+		| grep -iE '^(HTTP/|x-agentgate-)' || true
+	@echo
+	@echo "2. the same request again — served from cache this time"
+	@curl -s -D - -o /dev/null $(GATEWAY_URL)/v1/chat/completions \
+		-H 'content-type: application/json' \
+		-d '{"model":"general-chat","messages":[{"role":"user","content":"what happened to this payment"}],"max_tokens":32}' \
+		| grep -iE '^(HTTP/|x-agentgate-cache)' || true
+	@echo
+	@echo "3. a prompt carrying an AWS access key — the builtin guardrail refuses it"
+	@curl -s -o /dev/null -w '   HTTP %{http_code}\n' $(GATEWAY_URL)/v1/chat/completions \
+		-H 'content-type: application/json' \
+		-d '{"model":"general-chat","messages":[{"role":"user","content":"use key AKIAIOSFODNN7EXAMPLE"}],"max_tokens":32}'
+	@echo
+
+# ---------------------------------------------------------------------------
 # Local stack
 # ---------------------------------------------------------------------------
 

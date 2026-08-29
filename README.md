@@ -27,6 +27,26 @@ backends with controllable latency and failure), `agentctl` (developer and opera
 Everything below works from a fresh clone. Dependencies are vendored, so no network is needed to
 build.
 
+### One command
+
+```bash
+make run     # a mock model backend on :8090 and the gateway on :8080
+make demo    # in another terminal: a completion, a cache hit, and a blocked secret
+```
+
+No Docker, no Postgres, no Redis, no identity provider, no key material. `config/gateway.yaml`
+turns every dependency off on purpose — in-memory rate limiter, in-memory cache, builtin
+guardrails, and `identity.allow_unverified` so callers need no token. `make demo` prints the
+`x-agentgate-*` headers the gateway attaches to each decision:
+
+```
+X-Agentgate-Cache: miss          X-Agentgate-Guardrail: pass
+X-Agentgate-Pool: general-chat   X-Agentgate-Cost-Usd: 0.000011
+X-Agentgate-Model: mock-model-8b X-Agentgate-Tokens-Input: 17
+```
+
+Configuration validation refuses `allow_unverified` anywhere above `dev`.
+
 ### The whole stack
 
 ```bash
@@ -46,7 +66,9 @@ make load          # capacity proof against the local stack
 | Grafana | http://localhost:3000 |
 | Traces | http://localhost:16686 |
 
-### Just the gateway, no Docker
+### The same thing by hand
+
+`make run` is these two processes; run them yourself if you want separate terminals.
 
 ```bash
 go run ./cmd/mockprovider &                              # a fake model backend on :8090
@@ -56,10 +78,6 @@ curl -sS localhost:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"general-chat","messages":[{"role":"user","content":"what happened to this payment"}],"max_tokens":32}'
 ```
-
-The development config runs with token verification disabled and a clearly-marked synthetic
-identity, so an engineer can get a request through the full policy chain within a minute of
-cloning. Configuration validation refuses that shortcut anywhere above `dev`.
 
 ---
 
@@ -261,3 +279,7 @@ The core is cloud-neutral; the Terraform is not. Both mappings ship.
 Langfuse runs alongside either. [`docs/06-telemetry-schema.md`](docs/06-telemetry-schema.md) argues
 for a specific split between the managed plane and the self-hosted one rather than treating the
 choice as open indefinitely.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
