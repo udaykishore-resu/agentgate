@@ -314,14 +314,27 @@ smoke: ## End-to-end request through the gateway, asserting the frozen contract
 	echo "==> smoke passed"
 
 
+.PHONY: dev-token
+dev-token: ## Print a fresh access token for the example agent (local stack only)
+	@REG=$$(AGENTGATE_CONTROLPLANE_URL=$(CP_URL) AGENTGATE_ACTOR=loadgen@local \
+		$(GO) run ./cmd/agentctl register -f examples/agent.yaml -env dev -credential 2>&1); \
+	CLIENT_ID=$$(echo "$$REG" | awk '/^client_id:/{print $$2}'); \
+	CLIENT_SECRET=$$(echo "$$REG" | awk '/^client_secret:/{print $$2}'); \
+	test -n "$$CLIENT_ID" || { echo "$$REG" >&2; echo "registration did not return a credential" >&2; exit 1; }; \
+	AGENTGATE_CONTROLPLANE_URL=$(CP_URL) $(GO) run ./cmd/agentctl token \
+		-client-id "$$CLIENT_ID" -client-secret "$$CLIENT_SECRET" -env dev -q
+
 .PHONY: load
-load: ## Run the load test against the local stack
+load: ## Run the load test against the local stack (mints a token unless AGENTGATE_TOKEN is set)
 	# The mockprovider profiles in docker-compose.yml are deliberately uneven
 	# (1% / 8% / 0% failure) so a load run exercises retry, failover and the
 	# breaker rather than only measuring throughput.
+	@TOKEN=$${AGENTGATE_TOKEN:-}; \
+	if [ -z "$$TOKEN" ]; then TOKEN=$$($(MAKE) -s dev-token); fi; \
+	test -n "$$TOKEN" || { echo "could not obtain a token; set AGENTGATE_TOKEN or start the stack (make run-stack)" >&2; exit 1; }; \
 	$(GO) run ./cmd/loadgen \
 		-url=$(GATEWAY_URL) \
-		-token=$${AGENTGATE_TOKEN} \
+		-token="$$TOKEN" \
 		-d=$${DURATION:-60s} \
 		-rate=$${RATE:-50} \
 		-c=$${CONCURRENCY:-25} \
