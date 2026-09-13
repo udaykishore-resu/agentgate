@@ -11,7 +11,7 @@
 #
 # Build context is the REPO ROOT (the Go module root), not this directory.
 
-ARG GO_VERSION=1.24.5
+ARG GO_VERSION=1.24
 # Which runtime flavour to finish on. `plain` is pure distroless and is what
 # ships to Kubernetes, where the kubelet performs HTTP probes and the image
 # therefore needs no client tooling at all. `healthcheck` adds a single static
