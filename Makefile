@@ -213,6 +213,9 @@ demo: ## Drive a gateway started by `make run`: a normal call, a cache hit, a bl
 # Local stack
 # ---------------------------------------------------------------------------
 
+# The key is 644, not 600: the controlplane container runs as uid 65532 and
+# bind-mounts it read-only, so an owner-only mode is unreadable in-container.
+# It is dev-only, gitignored and regenerated on demand.
 .PHONY: dev-keys
 dev-keys:
 	@mkdir -p deploy/compose/keys
@@ -220,7 +223,7 @@ dev-keys:
 		echo "generating local token signing key (never leaves this machine, never committed)"; \
 		openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
 			-out deploy/compose/keys/signing.pem 2>/dev/null; \
-		chmod 600 deploy/compose/keys/signing.pem; }
+		chmod 644 deploy/compose/keys/signing.pem; }
 
 .PHONY: run-stack
 run-stack: dev-keys ## Build and start the full local stack

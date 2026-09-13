@@ -68,6 +68,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/agentgate-service \
       ./cmd/${SERVICE}
 
+# Empty, nonroot-owned state directory. Copied into the final image so a named
+# volume mounted at /var/lib/agentgate inherits uid 65532 on first creation
+# instead of Docker's root:root default, which the nonroot service could not
+# write its registry/secrets snapshots into.
+RUN mkdir -p /out/state
+
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime bases
 # ---------------------------------------------------------------------------
@@ -105,6 +111,7 @@ LABEL org.opencontainers.image.title="agentgate-${SERVICE}" \
       io.agentgate.service="${SERVICE}"
 
 COPY --from=build /out/agentgate-service /usr/local/bin/agentgate-service
+COPY --from=build --chown=65532:65532 /out/state /var/lib/agentgate
 
 # Explicit numeric uid:gid (not the name) so Kubernetes can assert
 # runAsNonRoot/runAsUser without resolving /etc/passwd inside the image.
