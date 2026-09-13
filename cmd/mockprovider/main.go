@@ -9,10 +9,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"math/rand"
 	"net/http"
 	"os"
@@ -112,6 +115,28 @@ func main() {
 	mux.HandleFunc("POST /v1/messages", handler)
 	// Azure OpenAI shape: /openai/deployments/{deployment}/chat/completions
 	mux.HandleFunc("POST /openai/deployments/{deployment}/chat/completions", handler)
+	// Bedrock runtime shape. The gateway's bedrock adapter never calls
+	// /v1/messages: it carries the model in the URL, chooses streaming by
+	// operation rather than a body field, and reads the streamed response in
+	// the AWS event-stream binary framing, not SSE. Bedrock's Anthropic models
+	// speak the Messages dialect on both operations, so this serves it
+	// whatever -flavor was given.
+	bedrock := func(stream bool) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			if !admit(w, cfg, rnd) {
+				return
+			}
+			body, _ := readJSON(r)
+			if stream {
+				serveBedrockStream(w, cfg, rnd, body)
+				return
+			}
+			serveAnthropic(w, cfg, rnd, body)
+		}
+	}
+	mux.HandleFunc("POST /model/{model}/invoke", bedrock(false))
+	mux.HandleFunc("POST /model/{model}/invoke-with-response-stream", bedrock(true))
 	mux.HandleFunc("POST /v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
 		if !admit(w, cfg, rnd) {
@@ -264,35 +289,107 @@ func serveAnthropic(w http.ResponseWriter, cfg config, rnd *rand.Rand, body map[
 		return
 	}
 	defer sse.Close()
+	anthropicEvents(cfg, id, parts, in, out, sse.Event)
+	sse.Done()
+}
+
+// anthropicEvents plays the Messages streaming event sequence through emit,
+// which is what differs between the native API (SSE, event name on the frame)
+// and Bedrock (event-stream binary frames, event type in a header).
+func anthropicEvents(cfg config, id string, parts []string, in, out int, emit func(name string, v any) error) {
 	time.Sleep(cfg.ttft)
-	_ = sse.Event("message_start", map[string]any{
+	_ = emit("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
 			"id": id, "type": "message", "role": "assistant", "model": cfg.model,
 			"usage": map[string]any{"input_tokens": in, "output_tokens": 0},
 		},
 	})
-	_ = sse.Event("content_block_start", map[string]any{
+	_ = emit("content_block_start", map[string]any{
 		"type": "content_block_start", "index": 0,
 		"content_block": map[string]any{"type": "text", "text": ""},
 	})
 	for _, p := range parts {
 		time.Sleep(cfg.interToken)
-		if err := sse.Event("content_block_delta", map[string]any{
+		if err := emit("content_block_delta", map[string]any{
 			"type": "content_block_delta", "index": 0,
 			"delta": map[string]any{"type": "text_delta", "text": p},
 		}); err != nil {
 			return
 		}
 	}
-	_ = sse.Event("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
-	_ = sse.Event("message_delta", map[string]any{
+	_ = emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	_ = emit("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": "end_turn"},
 		"usage": map[string]any{"output_tokens": out},
 	})
-	_ = sse.Event("message_stop", map[string]any{"type": "message_stop"})
-	sse.Done()
+	_ = emit("message_stop", map[string]any{"type": "message_stop"})
+}
+
+// serveBedrockStream answers InvokeModelWithResponseStream: the same Messages
+// events, each JSON-encoded, base64-wrapped in a {"bytes": ...} envelope and
+// framed as a `chunk` message in the AWS event-stream encoding.
+func serveBedrockStream(w http.ResponseWriter, cfg config, rnd *rand.Rand, body map[string]any) {
+	id := "msg_" + strconv.FormatInt(rnd.Int63(), 36)
+	parts := generate(cfg, body)
+	in, out := promptTokens(body), len(parts)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+	w.Header().Set("X-Amzn-Bedrock-Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	anthropicEvents(cfg, id, parts, in, out, func(_ string, v any) error {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		envelope, _ := json.Marshal(map[string]any{"bytes": raw}) // []byte marshals as base64
+		if _, err := w.Write(eventStreamFrame("chunk", envelope)); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	})
+}
+
+// eventStreamFrame encodes one AWS event-stream message carrying the
+// :event-type, :content-type and :message-type headers Bedrock sends.
+//
+//	 0..3   total length      uint32 big-endian
+//	 4..7   headers length    uint32 big-endian
+//	 8..11  prelude CRC32     uint32 (IEEE, over bytes 0..7)
+//	12..    headers           name-len(1) name value-type(1) value
+//	 ...    payload
+//	last 4  message CRC32     uint32 (IEEE, over everything before it)
+func eventStreamFrame(eventType string, payload []byte) []byte {
+	var headers bytes.Buffer
+	for _, h := range [][2]string{
+		{":event-type", eventType},
+		{":content-type", "application/json"},
+		{":message-type", "event"},
+	} {
+		headers.WriteByte(byte(len(h[0])))
+		headers.WriteString(h[0])
+		headers.WriteByte(7) // string
+		_ = binary.Write(&headers, binary.BigEndian, uint16(len(h[1])))
+		headers.WriteString(h[1])
+	}
+	total := 12 + headers.Len() + len(payload) + 4
+	frame := make([]byte, 0, total)
+	frame = binary.BigEndian.AppendUint32(frame, uint32(total))
+	frame = binary.BigEndian.AppendUint32(frame, uint32(headers.Len()))
+	frame = binary.BigEndian.AppendUint32(frame, crc32.ChecksumIEEE(frame))
+	frame = append(frame, headers.Bytes()...)
+	frame = append(frame, payload...)
+	frame = binary.BigEndian.AppendUint32(frame, crc32.ChecksumIEEE(frame))
+	return frame
 }
 
 func serveEmbeddings(w http.ResponseWriter, cfg config, body map[string]any) {
